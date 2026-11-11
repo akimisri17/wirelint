@@ -3,11 +3,13 @@
 v0 is inference only: it reads code and config files and needs nothing from
 you. Each later step is opt-in and adds only what inference cannot know.
 
-## v1: say what inference cannot guess
+## Shipped
 
-**Optional annotations in each service's own `.env.example`.** No central
-contract file. The annotation sits next to the variable it describes, in the
-repo that owns it.
+### v1 (0.2.0): say what inference cannot guess
+
+**Annotations in each service's own `.env.example`.** No central contract
+file. The annotation sits next to the variable it describes, in the repo that
+owns it.
 
 ```bash
 JWT_SECRET=           # wirelint: same-as identity-api
@@ -22,11 +24,14 @@ NEXT_PUBLIC_API_URL=  # wirelint: build-time
 | `build-time` | checked against build configuration instead of runtime configuration |
 
 **PR mode.** On a pull request, look only at variables the diff adds, and
-comment which deploy targets and environments each one is not yet set in. The
-point is to ask the question while the author still remembers the answer.
+say which deploy targets and environments each one is not yet set in. The
+comment body is written to a file; posting it is left to the user's CI step.
 
-Also in v1: resolve fallback chains across several variables, so
+**Fallback chains** across several variables are resolved, so
 `A ?? B ?? 'http://localhost'` fails only when none of them is set.
+
+Value equality for `same-as` is not checked in v1. The relation is kept in
+the JSON report (`relations`, with `compared: "existence"`) for v2.
 
 ## v2: look at what is actually deployed, opt-in
 

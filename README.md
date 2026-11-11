@@ -11,7 +11,7 @@ every deploy environment.
 npx wirelint ../my-workspace
 ```
 
-> **Status: v0, private, not yet on npm.** Until it is published, run it from a
+> **Status: v1 (0.2.0), private, not yet on npm.** Until it is published, run it from a
 > clone: `npm install && npm run build && node dist/cli.js <workspace-dir>`.
 
 ## Who it is for
@@ -76,6 +76,16 @@ other `.env.*` files, `docker-compose*.yml`, AWS Copilot
 It also prints the service-to-service links it inferred from local ports, so
 you can see who calls whom.
 
+v1 adds checks that only run when you annotate a variable (see below):
+
+| Check | Fails when |
+| --- | --- |
+| `annotation-invalid` | a `# wirelint:` annotation has an unknown word, a `same-as` without a target, or is not attached to a variable |
+| `same-as-unknown-service` | `same-as <service>` names a service that was not discovered |
+| `same-as-undeclared` | the other service no longer declares the variable in its `.env.example` or any deploy manifest |
+| `same-as-not-deployed` | the other service sets the variable for a deploy environment that this service does not |
+| `missing-from-build` | a `build-time` variable is in none of the visible build configurations (a suggestion when none is visible) |
+
 **How strictly a missing variable is treated depends on how the code reads it.**
 
 | The code does this | In `.env.example` check | In deploy-manifest check |
@@ -107,12 +117,111 @@ values (`${HOST}`, `<your-url>`, `your-domain`), and platform variables
   checkout, on the branch you are on.
 - No Kubernetes or Helm, no dashboards, no hosted service, no secret syncing,
   no auto-fixing.
-- Inference is pattern-based, not a type checker. Known gaps: a fallback chain
-  across several variables (`A ?? B ?? 'http://localhost'`) is treated as
-  optional for each member, and a guard that returns early before a second
-  variable is read can make that second variable look required.
+- Inference is pattern-based, not a type checker. Known gap: a guard that
+  returns early before a second variable is read can make that second
+  variable look required.
 - Computed reads such as `process.env[name]` cannot be analysed. They are
   listed once per service and never fail the run.
+
+## Annotations: say what inference cannot guess
+
+Optional. An annotation sits in the service's own `.env.example`, next to the
+variable it describes, either at the end of the line or on the line directly
+above it. Several are separated by commas. There is no central contract file.
+
+```bash
+JWT_SECRET=           # wirelint: same-as identity-api
+INTERNAL_SERVICE_KEY= # wirelint: same-as billing-api.ORDERS_SERVICE_KEY
+SENTRY_DSN=           # wirelint: optional
+
+# wirelint: build-time
+NEXT_PUBLIC_API_URL=http://localhost:4000
+```
+
+| Annotation | Effect |
+| --- | --- |
+| `same-as <service>` | this variable must hold the same value as the same-named one in `<service>`. It replaces the `shared-secret` guess with a declared relation (listed under `DECLARED RELATIONS` and in `--json` as `relations`), and fails when `<service>` does not exist, stops declaring the variable, or sets it for a deploy environment this service does not. `same-as <service>.<NAME>` covers a differently named variable. Values are not compared. |
+| `optional` | the variable may be absent from every deploy target; no `missing-from-deploy` finding |
+| `build-time` | checked against build configuration (Dockerfile `ARG`/`ENV`, compose `build.args`, `vercel.json` `build.env`) instead of runtime manifests. Fails only when a build configuration is visible and none sets it; otherwise a suggestion |
+
+A typo is a failure, not a silent no-op:
+
+```
+web  FEATURE_FLAGS  web/.env.example:3  unknown wirelint annotation "optinal", so it is not honoured
+                                        fix: write "optional" instead of "optinal"
+```
+
+## Fallback chains
+
+A chain of env reads is one requirement, satisfied when any member is set:
+
+```ts
+const identity = process.env.IDENTITY_URL ?? process.env.IDENTITY_API_URL ?? 'http://localhost:4100';
+```
+
+Each member on its own is optional, so neither is reported alone. When a
+deploy environment sets none of them, the chain is reported once:
+
+```
+gateway  IDENTITY_URL | IDENTITY_API_URL  gateway/copilot/gateway/manifest.yml
+         fallback chain IDENTITY_URL -> IDENTITY_API_URL read in gateway/src/main.ts:1 (falls back to a
+         localhost default), but none of them is set for environment prod; once deployed it silently
+         points at localhost
+         fix: add IDENTITY_URL to environments.prod.variables; any one of IDENTITY_URL, IDENTITY_API_URL
+         satisfies the chain
+```
+
+The chain is graded like a single read: a localhost or missing fallback is
+checked, a real default is not. `||` chains work the same way.
+
+## PR mode
+
+```bash
+wirelint --pr [--base <ref>] [--comment-file <path>] [workspace-dir]
+```
+
+On a pull request, ask the question while the author still remembers the
+answer. For every git repository among the services (each sibling repo, or
+the monorepo once), wirelint diffs `base...HEAD` and keeps only the variables
+the diff adds: new env reads on added source lines and new names in
+`.env.example`. An edited or moved line does not count. For each one it says
+which deploy targets and environments do not set it yet, then prints the
+usual findings filtered to those variables.
+
+```
+NEW IN THIS DIFF (1)
+  orders-api  REFUNDS_SIGNING_KEY  added in orders-api/src/refunds.ts:1 (+1 more)
+    not yet set in: orders-api/copilot/orders-api/manifest.yml (dev, prod)
+```
+
+The base is `--base`, else `origin/$GITHUB_BASE_REF` when that is set, else
+`origin/main`, else `main`. Nothing is fetched: the ref must already be in the
+checkout. A repository with no resolvable base is skipped with a note. Exit
+codes are the same as a full run.
+
+With `--comment-file` it also writes a Markdown comment body, and appends the
+same body to `$GITHUB_STEP_SUMMARY` when that is set. wirelint never posts
+anything; post the file with your own step:
+
+```yaml
+on: pull_request
+jobs:
+  wirelint:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, pull-requests: write }
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npx wirelint --pr --comment-file wirelint-comment.md .
+      - if: always()
+        run: gh pr comment ${{ github.event.pull_request.number }} --body-file wirelint-comment.md --edit-last || gh pr comment ${{ github.event.pull_request.number }} --body-file wirelint-comment.md
+        env: { GH_TOKEN: "${{ github.token }}" }
+```
+
+`fetch-depth: 0` matters: without history, `origin/<base>` is not in the
+checkout and the repository is skipped.
 
 ## Secrets
 
@@ -127,6 +236,7 @@ Findings from those files describe the problem without quoting the value.
 wirelint [workspace-dir]            # table: service, variable, where, problem, fix
 wirelint --json [workspace-dir]     # the same report as JSON
 wirelint --no-hints [workspace-dir] # hide suggestions
+wirelint --pr [workspace-dir]       # only what this branch adds (see PR mode)
 ```
 
 Exit code `1` when there are failures, `0` when there are only suggestions,
