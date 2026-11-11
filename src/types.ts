@@ -93,6 +93,45 @@ export interface Suppression {
   line: number;
 }
 
+export type AnnotationKind = 'same-as' | 'optional' | 'build-time';
+
+/** One `# wirelint: ...` annotation from a service's own .env.example. */
+export interface Annotation {
+  kind: AnnotationKind;
+  /** Service that owns the annotated variable. */
+  service: string;
+  variable: string;
+  file: string;
+  line: number;
+  /** For same-as: the target exactly as written, `<service>` or `<service>.<NAME>`. */
+  target?: string;
+}
+
+/**
+ * A declared same-value relation: `variable` in `service` must hold the same
+ * value as `target.variable` in `target.service`. v1 checks only that both
+ * sides still declare it; `compared` says so, so a later version that compares
+ * values can tell what has already been checked.
+ */
+export interface Relation {
+  kind: 'same-as';
+  service: string;
+  variable: string;
+  file: string;
+  line: number;
+  target: { service: string; variable: string };
+  compared: 'existence';
+}
+
+/** Names visible to a build: Dockerfile ARG/ENV, compose build.args, vercel.json build.env. */
+export interface BuildConfig {
+  kind: 'dockerfile' | 'compose' | 'vercel';
+  file: string;
+  /** Compose service name, for the fix text. */
+  name?: string;
+  names: Set<string>;
+}
+
 export interface Service {
   name: string;
   dir: string;
@@ -112,6 +151,9 @@ export interface Service {
   aliases: Set<string>;
   suppress: Map<string, Suppression>;
   badSuppressions: { file: string; line: number; name?: string }[];
+  annotations: Annotation[];
+  badAnnotations: { file: string; line: number; name?: string; problem: string; fix: string }[];
+  build: BuildConfig[];
   filesScanned: number;
 }
 
@@ -150,6 +192,10 @@ export interface Report {
     ports: number[];
   }[];
   edges: Edge[];
+  /** Annotations read from .env.example files, valid or not. */
+  annotations: Annotation[];
+  /** Resolved same-as relations. */
+  relations: Relation[];
   findings: Finding[];
   summary: {
     failures: number;

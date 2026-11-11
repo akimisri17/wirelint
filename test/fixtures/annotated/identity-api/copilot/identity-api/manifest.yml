@@ -1,0 +1,7 @@
+name: identity-api
+type: Backend Service
+secrets:
+  JWT_SECRET: /identity/JWT_SECRET
+environments:
+  dev:
+  prod:

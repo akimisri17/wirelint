@@ -61,6 +61,8 @@ export function collectEnvFiles(workspace: string, svc: Service): void {
       if (isExample) {
         for (const ig of parsed.ignores) svc.suppress.set(ig.name, { reason: ig.reason, file, line: ig.line });
         for (const bad of parsed.badIgnores) svc.badSuppressions.push({ file, line: bad.line, name: bad.name });
+        for (const a of parsed.annotations) svc.annotations.push({ kind: a.kind, service: svc.name, variable: a.name, file, line: a.line, target: a.target });
+        for (const bad of parsed.badAnnotations) svc.badAnnotations.push({ file, ...bad });
       }
     }
   }
@@ -173,20 +175,33 @@ export function collectVercel(workspace: string, svc: Service): void {
     }
   };
   take(doc['env']);
-  take((doc['build'] as { env?: unknown } | undefined)?.env);
+  const buildEnv = (doc['build'] as { env?: unknown } | undefined)?.env;
+  take(buildEnv);
   if (vars.size > 0) svc.targets.push({ kind: 'vercel', file: rel(workspace, abs), name: 'vercel', envs: [{ name: '*', vars }] });
+  if (buildEnv && typeof buildEnv === 'object') {
+    svc.build.push({ kind: 'vercel', file: rel(workspace, abs), names: new Set(Object.keys(buildEnv as Record<string, unknown>)) });
+  }
 }
 
-export function collectDockerfile(svc: Service): void {
+export function collectDockerfile(workspace: string, svc: Service): void {
   for (const e of listDir(svc.dir)) {
     if (!e.isFile() || !/^Dockerfile(\..+)?$/.test(e.name)) continue;
-    const text = readText(path.join(svc.dir, e.name));
+    const abs = path.join(svc.dir, e.name);
+    const text = readText(abs);
     if (!text) continue;
-    for (const m of text.replace(/\\\r?\n/g, ' ').matchAll(/^[ \t]*ENV[ \t]+(.+)$/gim)) {
-      const body = m[1]!;
-      if (body.includes('=')) for (const kv of body.matchAll(/([A-Za-z_][A-Za-z0-9_]*)=/g)) svc.baked.add(kv[1]!);
-      else svc.baked.add(body.trim().split(/\s+/)[0]!);
+    // ARG and ENV are both visible while the image builds; only ENV survives into the container.
+    const build = new Set<string>();
+    for (const m of text.replace(/\\\r?\n/g, ' ').matchAll(/^[ \t]*(ENV|ARG)[ \t]+(.+)$/gim)) {
+      const body = m[2]!;
+      const names = m[1]!.toUpperCase() === 'ARG' || !body.includes('=')
+        ? [body.trim().split(/[\s=]+/)[0]!]
+        : [...body.matchAll(/([A-Za-z_][A-Za-z0-9_]*)=/g)].map((kv) => kv[1]!);
+      for (const name of names) {
+        build.add(name);
+        if (m[1]!.toUpperCase() === 'ENV') svc.baked.add(name);
+      }
     }
+    svc.build.push({ kind: 'dockerfile', file: rel(workspace, abs), names: build });
   }
 }
 
@@ -233,6 +248,13 @@ export function collectCompose(workspace: string, services: Service[]): void {
           const m = spec ? /^(?:[\d.]+:)?(\d{2,5}):\d+/.exec(spec.replace(/\$\{[^}:]+:-(\d+)\}/g, '$1')) : null;
           const port = Number(published ?? m?.[1]);
           if (port > 0) svc.composePorts.add(port);
+        }
+
+        const args = asMap(build)?.['args'];
+        if (args !== undefined) {
+          const names = new Map<string, DeclaredVar>();
+          varsFromYaml(args, text, names, false);
+          svc.build.push({ kind: 'compose', file: rel(workspace, abs), name, names: new Set(names.keys()) });
         }
 
         const vars = new Map<string, DeclaredVar>();

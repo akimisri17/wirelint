@@ -34,6 +34,8 @@ export function run(workspace: string, baseline: Set<string> = new Set()): Repor
       ports: [...s.ports].sort((x, y) => x - y),
     })),
     edges: a.edges,
+    annotations: a.annotations,
+    relations: a.relations,
     findings,
     summary: {
       failures: findings.filter((f) => f.severity === 'error').length,

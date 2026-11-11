@@ -5,13 +5,15 @@ import { discoverServices } from './discover.js';
 import { readText, rel, walkSources } from './fsutil.js';
 import { isBaseUrlVar, isListVar, isLocationVar, isPlatformVar, isProdName, isProvidedByTarget, isSecretLooking, isVendorVar } from './names.js';
 import { scanSource } from './reads.js';
-import type { DeclaredVar, DeployTarget, Edge, EnvRead, Finding, ReadKind, Service, Severity, ShapeCode } from './types.js';
+import type { Annotation, AnnotationKind, BuildConfig, DeclaredVar, DeployTarget, Edge, EnvRead, Finding, ReadKind, Relation, Service, Severity, ShapeCode } from './types.js';
 import { isPlaceholder, redact } from './url.js';
 
 export interface Analysis {
   workspace: string;
   services: Service[];
   edges: Edge[];
+  annotations: Annotation[];
+  relations: Relation[];
   findings: Finding[];
   suppressed: number;
 }
@@ -49,12 +51,15 @@ function loadServices(workspace: string): Service[] {
       aliases: new Set(),
       suppress: new Map(),
       badSuppressions: [],
+      annotations: [],
+      badAnnotations: [],
+      build: [],
       filesScanned: 0,
     };
     collectEnvFiles(workspace, svc);
     collectCopilot(workspace, svc);
     collectVercel(workspace, svc);
-    collectDockerfile(svc);
+    collectDockerfile(workspace, svc);
     collectPackagePorts(svc);
 
     const exclude = new Set([...allDirs].filter((d) => d !== svc.dir));
@@ -110,6 +115,42 @@ function usesOf(svc: Service): Map<string, VarUse> {
   return uses;
 }
 
+/** Annotation words per variable. */
+export function annotationsOf(svc: Service): Map<string, Set<AnnotationKind>> {
+  const out = new Map<string, Set<AnnotationKind>>();
+  for (const a of svc.annotations) {
+    if (!out.has(a.variable)) out.set(a.variable, new Set());
+    out.get(a.variable)!.add(a.kind);
+  }
+  return out;
+}
+
+/**
+ * The deploy targets a service's runtime variables are checked against:
+ * its workload manifests, plus any production compose file.
+ */
+export function deployTargetsOf(svc: Service): DeployTarget[] {
+  return [...manifestsFor(svc).use, ...svc.targets.filter((t) => t.kind === 'compose' && t.envs.some((e) => isProdName(e.name)))];
+}
+
+/**
+ * Resolve a same-as target: an exact service name, or a unique directory
+ * basename (`api` for `apps/api`), optionally followed by `.<VARIABLE>`.
+ */
+function resolveTarget(services: Service[], raw: string, variable: string): { svc: Service; variable: string } | null {
+  const byName = (name: string): Service | undefined => {
+    const exact = services.find((s) => s.name === name);
+    if (exact) return exact;
+    const base = services.filter((s) => path.basename(s.dir) === name);
+    return base.length === 1 ? base[0] : undefined;
+  };
+  const whole = byName(raw);
+  if (whole) return { svc: whole, variable };
+  const m = /^(.+)\.([A-Za-z_][A-Za-z0-9_]*)$/.exec(raw);
+  const svc = m ? byName(m[1]!) : undefined;
+  return svc ? { svc, variable: m![2]! } : null;
+}
+
 /**
  * When a repo carries several workload manifests and exactly one is named
  * after the service, the others are treated as strays (copied or retired).
@@ -134,6 +175,7 @@ export function analyze(workspaceArg: string): Analysis {
   const workspace = path.resolve(workspaceArg);
   const services = loadServices(workspace);
   const findings: Finding[] = [];
+  const relations: Relation[] = [];
   let suppressed = 0;
 
   const push = (
@@ -179,6 +221,24 @@ export function analyze(workspaceArg: string): Analysis {
         fix: 'write "# wirelint-ignore: <why this is safe to ignore>"',
       });
     }
+
+    // --- annotations that cannot be honoured are themselves a failure
+    for (const bad of svc.badAnnotations) {
+      push(null, {
+        check: 'annotation-invalid',
+        severity: 'error',
+        service: svc.name,
+        variable: bad.name ?? '(annotation)',
+        file: bad.file,
+        line: bad.line,
+        problem: `${bad.problem}, so it is not honoured`,
+        fix: bad.fix,
+      });
+    }
+    const ann = annotationsOf(svc);
+    const has = (name: string, kind: AnnotationKind) => ann.get(name)?.has(kind) ?? false;
+    /** Annotated as not checked against runtime deploy targets. */
+    const runtimeExempt = (name: string) => has(name, 'optional') || has(name, 'build-time');
 
     // --- (a) read in code, absent from .env.example
     const examples = svc.envFiles.filter((f) => f.isExample);
@@ -233,10 +293,12 @@ export function analyze(workspaceArg: string): Analysis {
         fix: 'delete it if it is a stray copy',
       });
     }
-    const deployTargets = [...manifests, ...svc.targets.filter((t) => t.kind === 'compose' && t.envs.some((e) => isProdName(e.name)))];
+    const deployTargets = deployTargetsOf(svc);
+    /** `name|file|env` already reported missing, so a later check does not repeat it. */
+    const reported = new Set<string>();
     for (const target of deployTargets) {
       for (const u of active) {
-        if (u.kind === 'default' || u.kind === 'flag') continue;
+        if (u.kind === 'default' || u.kind === 'flag' || runtimeExempt(u.name)) continue;
         if (svc.baked.has(u.name) || isProvidedByTarget(target.kind, u.name)) continue;
         const checkable = target.envs.filter((e) => !e.opaque);
         const missing = checkable.filter((e) => !e.vars.has(u.name)).map((e) => e.name);
@@ -249,6 +311,7 @@ export function analyze(workspaceArg: string): Analysis {
         // An unguarded read only fails the run when the team has declared the
         // variable in .env.example; an undocumented one is reported by check (a).
         const hard = u.kind !== 'plain' || inExample.has(u.name);
+        for (const env of missing) reported.add(`${u.name}|${target.file}|${env}`);
         push(svc, {
           check: 'missing-from-deploy',
           severity: hard ? 'error' : 'hint',
@@ -259,6 +322,107 @@ export function analyze(workspaceArg: string): Analysis {
             `read in ${u.first.file}:${u.first.line} (${KIND_NOTE[u.kind]}) but not set for ${envLabel}` +
             (u.kind === 'localdefault' ? '; once deployed it silently points at localhost' : ''),
           fix: fixForTarget(target, u.name, everywhere ? null : missing),
+        });
+      }
+    }
+
+    // --- build-time variables are checked against build configuration instead
+    const buildTime = [...ann].filter(([n, kinds]) => kinds.has('build-time') && !kinds.has('optional') && !isPlatformVar(n)).map(([n]) => n).sort();
+    for (const name of buildTime) {
+      const where = svc.annotations.find((a) => a.variable === name && a.kind === 'build-time')!;
+      if (svc.build.length === 0) {
+        push(svc, {
+          check: 'missing-from-build',
+          severity: 'hint',
+          variable: name,
+          file: where.file,
+          line: where.line,
+          problem: 'annotated build-time, but no build configuration (Dockerfile ARG/ENV, compose build.args, vercel.json build.env) is visible for this service',
+          fix: `make sure ${name} is set where the build runs (the CI job or the hosting platform's build settings)`,
+        });
+        continue;
+      }
+      if (svc.build.some((b) => b.names.has(name))) continue;
+      push(svc, {
+        check: 'missing-from-build',
+        severity: 'error',
+        variable: name,
+        file: svc.build[0]!.file,
+        problem: `annotated build-time in ${where.file}:${where.line}, but not set in any build configuration: ${svc.build.map((b) => b.file).join(', ')}`,
+        fix: svc.build.map((b) => fixForBuild(b, name)).join(', or '),
+      });
+    }
+
+    // --- declared same-as relations
+    for (const a of svc.annotations) {
+      if (a.kind !== 'same-as' || !a.target) continue;
+      const resolved = resolveTarget(services, a.target, a.variable);
+      if (!resolved) {
+        const others = services.filter((s) => s !== svc).map((s) => s.name);
+        const shown = others.slice(0, 8).join(', ') + (others.length > 8 ? `, +${others.length - 8} more` : '');
+        push(svc, {
+          check: 'same-as-unknown-service',
+          severity: 'error',
+          variable: a.variable,
+          file: a.file,
+          line: a.line,
+          problem: `same-as names "${a.target}", which is not a discovered service${others.length ? ` (found: ${shown})` : ''}`,
+          fix: others.length ? `change it to "same-as <service>" with one of: ${shown}, or remove the annotation` : 'remove the annotation; no other service was found',
+        });
+        continue;
+      }
+      const { svc: other, variable: otherName } = resolved;
+      if (other === svc && otherName === a.variable) {
+        push(svc, {
+          check: 'annotation-invalid',
+          severity: 'error',
+          variable: a.variable,
+          file: a.file,
+          line: a.line,
+          problem: `same-as points at the variable itself (${svc.name}.${a.variable}), so it is not honoured`,
+          fix: 'name the other service that must hold the same value',
+        });
+        continue;
+      }
+      relations.push({ kind: 'same-as', service: svc.name, variable: a.variable, file: a.file, line: a.line, target: { service: other.name, variable: otherName }, compared: 'existence' });
+
+      const otherDeploy = deployTargetsOf(other);
+      const declared =
+        other.envFiles.some((f) => f.isExample && f.vars.has(otherName)) || other.targets.some((t) => t.envs.some((e) => e.vars.has(otherName)));
+      if (!declared) {
+        const otherRel = rel(workspace, other.dir);
+        const otherExample = other.envFiles.find((f) => f.isExample && path.posix.dirname(f.file) === otherRel)?.file ?? (otherRel === '.' ? '.env.example' : `${otherRel}/.env.example`);
+        push(svc, {
+          check: 'same-as-undeclared',
+          severity: 'error',
+          variable: a.variable,
+          file: a.file,
+          line: a.line,
+          problem: `declared same-as ${other.name}.${otherName}, but ${other.name} no longer declares ${otherName} in its .env.example or any deploy manifest`,
+          fix: `add ${otherName} back to ${otherExample}, or remove the same-as annotation if ${svc.name} no longer shares it`,
+        });
+        continue;
+      }
+      if (runtimeExempt(a.variable) || svc.baked.has(a.variable)) continue;
+      const otherHas = (env: string) =>
+        otherDeploy.some((t) => t.envs.some((e) => (e.name === env || e.name === '*' || env === '*') && e.vars.has(otherName)));
+      for (const target of deployTargets) {
+        if (isProvidedByTarget(target.kind, a.variable)) continue;
+        const checkable = target.envs.filter((e) => !e.opaque);
+        const missing = checkable
+          .filter((e) => !e.vars.has(a.variable) && otherHas(e.name) && !reported.has(`${a.variable}|${target.file}|${e.name}`))
+          .map((e) => e.name);
+        if (missing.length === 0) continue;
+        const everywhere = missing.length === checkable.length;
+        const envLabel = missing[0] === '*' ? 'its deploy target' : `environment${missing.length > 1 ? 's' : ''} ${missing.join(', ')}`;
+        push(svc, {
+          check: 'same-as-not-deployed',
+          severity: 'error',
+          variable: a.variable,
+          file: target.file,
+          env: missing.join(','),
+          problem: `declared same-as ${other.name}.${otherName} in ${a.file}:${a.line}; ${other.name} sets it for ${envLabel}, but this deploy target does not set ${a.variable}`,
+          fix: fixForTarget(target, a.variable, everywhere ? null : missing),
         });
       }
     }
@@ -337,13 +501,20 @@ export function analyze(workspaceArg: string): Analysis {
   }
 
   const edges = inferEdges(services);
-  sharedSecretHints(services, edges, push);
+  sharedSecretHints(services, edges, relations, push);
 
   const rank: Record<Severity, number> = { error: 0, hint: 1, info: 2 };
   findings.sort(
     (a, b) => rank[a.severity] - rank[b.severity] || a.service.localeCompare(b.service) || a.check.localeCompare(b.check) || a.variable.localeCompare(b.variable),
   );
-  return { workspace, services, edges, findings, suppressed };
+  const annotations = services.flatMap((s) => s.annotations);
+  return { workspace, services, edges, annotations, relations, findings, suppressed };
+}
+
+function fixForBuild(b: BuildConfig, name: string): string {
+  if (b.kind === 'dockerfile') return `add "ARG ${name}" to ${b.file}`;
+  if (b.kind === 'compose') return `add ${name} to services.${b.name}.build.args in ${b.file}`;
+  return `add ${name} to "build.env" in ${b.file}`;
 }
 
 function fixForTarget(target: DeployTarget, name: string, envs: string[] | null): string {
@@ -384,7 +555,13 @@ function inferEdges(services: Service[]): Edge[] {
 type Push = (svc: Service | null, f: { check: string; severity: Severity; service?: string; variable: string; file: string; line?: number; env?: string; anchor?: string; problem: string; fix: string }) => void;
 
 /** Suggestions only: secrets that two services probably need to agree on. */
-function sharedSecretHints(services: Service[], edges: Edge[], push: Push): void {
+function sharedSecretHints(services: Service[], edges: Edge[], relations: Relation[], push: Push): void {
+  const related = (a: Service, an: string, b: Service, bn: string) =>
+    relations.some(
+      (r) =>
+        (r.service === a.name && r.variable === an && r.target.service === b.name && r.target.variable === bn) ||
+        (r.service === b.name && r.variable === bn && r.target.service === a.name && r.target.variable === an),
+    );
   const holders = new Map<string, Set<Service>>();
   const note = (name: string, svc: Service): void => {
     if (!isSecretLooking(name) || isPlatformVar(name) || isVendorVar(name) || svc.suppress.has(name)) return;
@@ -401,6 +578,13 @@ function sharedSecretHints(services: Service[], edges: Edge[], push: Push): void
   for (const [name, set] of [...holders].sort((a, b) => a[0].localeCompare(b[0]))) {
     if (set.size < 2) continue;
     const list = [...set].sort((a, b) => a.name.localeCompare(b.name));
+    // A declared same-as relation replaces the guess when it links every holder.
+    const reached = new Set([list[0]!]);
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const s of list) if (!reached.has(s) && [...reached].some((r) => related(r, name, s, name))) grew = reached.add(s).size > 0;
+    }
+    if (reached.size === list.length) continue;
     const notes: string[] = [];
     if (list.some((a) => list.some((b) => a !== b && connected(a, b)))) notes.push('at least two of them call each other');
     const exampleValues = list
@@ -439,7 +623,7 @@ function sharedSecretHints(services: Service[], edges: Edge[], push: Push): void
   }
   for (const group of byValue.values()) {
     const first = group[0]!;
-    const other = group.find((g) => g.svc !== first.svc && g.name !== first.name);
+    const other = group.find((g) => g.svc !== first.svc && g.name !== first.name && !related(first.svc, first.name, g.svc, g.name));
     if (!other) continue;
     push(null, {
       check: 'shared-secret',

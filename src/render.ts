@@ -58,6 +58,10 @@ export function renderHuman(report: Report, opts: { width?: number; hints?: bool
     out.push('', `INFERRED LINKS (${report.edges.length})`);
     for (const e of report.edges) out.push(`  ${e.from} -> ${e.to}  via ${e.variable}${e.port ? ` (port ${e.port})` : ''}  [${e.file}]`);
   }
+  if (report.relations.length) {
+    out.push('', `DECLARED RELATIONS (${report.relations.length}) - existence is checked, values are not compared`);
+    for (const r of report.relations) out.push(`  ${r.service}.${r.variable} same-as ${r.target.service}.${r.target.variable}  [${r.file}:${r.line}]`);
+  }
   if (notes.length) {
     out.push('', `NOT ANALYSED (${notes.length})`);
     for (const n of notes) out.push(`  ${n.service}: ${n.problem}`);
