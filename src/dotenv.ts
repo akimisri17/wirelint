@@ -50,7 +50,8 @@ const ANNOTATION_LINE_RE = /^#\s*wirelint:(.*)$/;
 const ANNOTATION_INLINE_RE = /(?:^|\s)#\s*wirelint:([^#]*)/;
 
 const KINDS: AnnotationKind[] = ['same-as', 'optional', 'build-time'];
-const USAGE = 'use same-as <service>, optional or build-time, separated by commas';
+const PROSE = 'put any explanation after " -- ", e.g. "# wirelint: optional -- only used in prod"';
+const USAGE = `use same-as <service>, optional or build-time, separated by commas; ${PROSE}`;
 
 /** Edit distance, for suggesting the annotation a typo meant. */
 function distance(a: string, b: string): number {
@@ -69,8 +70,10 @@ interface Parsed {
 }
 
 /** Parse the text after `wirelint:`. */
-export function parseAnnotation(body: string): Parsed {
+export function parseAnnotation(text: string): Parsed {
   const out: Parsed = { items: [], bad: [] };
+  // Free prose after " -- " is a note for humans and is ignored.
+  const body = text.split(/(?:^|\s)--(?:\s|$)/)[0]!;
   const parts = body.split(',').map((p) => p.trim());
   if (parts.every((p) => p === '')) {
     out.bad.push({ problem: 'wirelint annotation is empty', fix: USAGE });
@@ -84,7 +87,7 @@ export function parseAnnotation(body: string): Parsed {
       const near = KINDS.find((k) => distance(k, word.toLowerCase().replace(/_/g, '-')) <= 2);
       out.bad.push({
         problem: `unknown wirelint annotation "${word}"`,
-        fix: near ? `write "${near}"${near === 'same-as' ? ' <service>' : ''} instead of "${word}"` : USAGE,
+        fix: near ? `write "${near}"${near === 'same-as' ? ' <service>' : ''} instead of "${word}"; ${PROSE}` : USAGE,
       });
       continue;
     }
@@ -94,14 +97,14 @@ export function parseAnnotation(body: string): Parsed {
         continue;
       }
       if (args.length > 1) {
-        out.bad.push({ problem: `"${part}" has more than one target`, fix: 'name one service per same-as, and separate annotations with commas' });
+        out.bad.push({ problem: `"${part}" has more than one target`, fix: `name one service per same-as, and separate annotations with commas; ${PROSE}` });
         continue;
       }
       out.items.push({ kind, target: args[0]! });
       continue;
     }
     if (args.length > 0) {
-      out.bad.push({ problem: `"${kind}" takes no argument, got "${args.join(' ')}"`, fix: `write "${kind}", and separate annotations with commas` });
+      out.bad.push({ problem: `"${kind}" takes no argument, got "${args.join(' ')}"`, fix: `write "${kind}", and separate annotations with commas; ${PROSE}` });
       continue;
     }
     out.items.push({ kind });
@@ -156,7 +159,7 @@ export function parseEnv(text: string): ParsedEnv {
       out.badAnnotations.push({
         line: p.line,
         problem: 'wirelint annotation is not attached to a variable',
-        fix: "put it at the end of the variable's line, or on the line directly above it",
+        fix: `put it at the end of the variable's line, or on the line directly above it; ${PROSE} instead of on a separate comment line`,
       });
     }
     pendingAnn = [];

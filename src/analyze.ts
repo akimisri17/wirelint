@@ -393,13 +393,18 @@ export function analyze(workspaceArg: string): Analysis {
         continue;
       }
       if (svc.build.some((b) => b.names.has(name))) continue;
+      // Only a container deploy target shows that these build files are what
+      // produces the deployed artifact; otherwise the build may happen elsewhere.
+      const container = deployTargets.some((t) => t.kind === 'copilot' || t.kind === 'compose');
       push(svc, {
         check: 'missing-from-build',
-        severity: 'error',
+        severity: container ? 'error' : 'hint',
         variable: name,
         file: svc.build[0]!.file,
-        problem: `annotated build-time in ${where.file}:${where.line}, but not set in any build configuration: ${svc.build.map((b) => b.file).join(', ')}`,
-        fix: svc.build.map((b) => fixForBuild(b, name)).join(', or '),
+        problem:
+          `annotated build-time in ${where.file}:${where.line}, but not set in any build configuration: ${svc.build.map((b) => b.file).join(', ')}` +
+          (container ? '' : '; no container deploy target is visible, so the deployed build may not use these files'),
+        fix: svc.build.map((b) => fixForBuild(b, name)).join(', or ') + (container ? '' : `, or make sure ${name} is set where the deployed build runs`),
       });
     }
 

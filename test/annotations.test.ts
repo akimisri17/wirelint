@@ -45,15 +45,33 @@ describe('annotation parser', () => {
       ].join('\n'),
     );
     expect(annotations).toEqual([]);
+    const prose = 'put any explanation after " -- ", e.g. "# wirelint: optional -- only used in prod"';
+    const usage = `use same-as <service>, optional or build-time, separated by commas; ${prose}`;
+    const dangling = `put it at the end of the variable's line, or on the line directly above it; ${prose} instead of on a separate comment line`;
     expect(badAnnotations.map((b) => [b.line, b.name ?? null, b.problem, b.fix])).toEqual([
-      [1, 'A', 'unknown wirelint annotation "optinal"', 'write "optional" instead of "optinal"'],
+      [1, 'A', 'unknown wirelint annotation "optinal"', `write "optional" instead of "optinal"; ${prose}`],
       [2, 'B', '"same-as" names no service', 'write "# wirelint: same-as <service>" or "same-as <service>.<VARIABLE>"'],
-      [3, 'C', '"optional" takes no argument, got "please"', 'write "optional", and separate annotations with commas'],
-      [4, 'D', 'unknown wirelint annotation "frobnicate"', 'use same-as <service>, optional or build-time, separated by commas'],
-      [5, 'E', 'wirelint annotation is empty', 'use same-as <service>, optional or build-time, separated by commas'],
-      [6, null, 'wirelint annotation is not attached to a variable', "put it at the end of the variable's line, or on the line directly above it"],
-      [9, null, 'wirelint annotation is not attached to a variable', "put it at the end of the variable's line, or on the line directly above it"],
+      [3, 'C', '"optional" takes no argument, got "please"', `write "optional", and separate annotations with commas; ${prose}`],
+      [4, 'D', 'unknown wirelint annotation "frobnicate"', usage],
+      [5, 'E', 'wirelint annotation is empty', usage],
+      [6, null, 'wirelint annotation is not attached to a variable', dangling],
+      [9, null, 'wirelint annotation is not attached to a variable', dangling],
     ]);
+  });
+
+  it('ignores free prose after " -- ", inline and on the line above', () => {
+    const p = parseEnv(
+      ['SENTRY_DSN=  # wirelint: optional -- only used in prod', '# wirelint: same-as identity-api, build-time -- see the auth runbook, same-as nobody', 'JWT_SECRET=', 'X=1 # wirelint: optional --'].join('\n'),
+    );
+    expect(p.badAnnotations).toEqual([]);
+    expect(p.annotations.map((a) => [a.name, a.kind, a.target])).toEqual([
+      ['SENTRY_DSN', 'optional', undefined],
+      ['JWT_SECRET', 'same-as', 'identity-api'],
+      ['JWT_SECRET', 'build-time', undefined],
+      ['X', 'optional', undefined],
+    ]);
+    // A hyphenated word is not the separator.
+    expect(parseEnv('A=1 # wirelint: build-time').annotations.map((a) => a.kind)).toEqual(['build-time']);
   });
 
   it('does not confuse an annotation with a suppression marker', () => {
@@ -96,7 +114,7 @@ describe('fixture: annotations and a fallback chain', () => {
   it('states the exact fix for each annotation finding', () => {
     expect(find(report, 'same-as-not-deployed')[0]).toMatchObject({ env: 'prod', file: 'gateway/copilot/gateway/manifest.yml', fix: 'add JWT_SECRET to environments.prod.secrets' });
     expect(find(report, 'missing-from-build', 'BUILD_SHA')[0]!.fix).toBe('add "ARG BUILD_SHA" to gateway/Dockerfile');
-    expect(find(report, 'annotation-invalid')[0]!.fix).toBe('write "optional" instead of "optinal"');
+    expect(find(report, 'annotation-invalid')[0]!.fix).toContain('write "optional" instead of "optinal"; put any explanation after " -- "');
     expect(find(report, 'same-as-unknown-service')[0]!.problem).toContain('(found: gateway, identity-api)');
     expect(find(report, 'same-as-undeclared')[0]!.fix).toBe('add GATEWAY_INTERNAL_KEY back to identity-api/.env.example, or remove the same-as annotation if gateway no longer shares it');
   });
@@ -221,12 +239,22 @@ describe('build-time', () => {
   it('fails when a build configuration is visible and lacks it, naming every place it could go', () => {
     const r = service({
       ...code,
+      'copilot/svc/manifest.yml': manifest('svc', 'variables:\n  X: "1"\n'),
       Dockerfile: 'FROM node:22\nARG OTHER\n',
       'docker-compose.yml': 'services:\n  svc:\n    build:\n      context: .\n      args:\n        OTHER: "1"\n',
     });
     const [f] = find(r, 'missing-from-build');
     expect(f).toMatchObject({ severity: 'error', variable: 'NEXT_PUBLIC_API_URL' });
     expect(f!.fix).toBe('add "ARG NEXT_PUBLIC_API_URL" to svc/Dockerfile, or add NEXT_PUBLIC_API_URL to services.svc.build.args in svc/docker-compose.yml');
+  });
+
+  it('only suggests when no container deploy target shows the build files are what ships', () => {
+    const r = service({ ...code, Dockerfile: 'FROM node:22\nARG OTHER\n', 'vercel.json': '{ "env": { "X": "1" } }' });
+    const [f] = find(r, 'missing-from-build');
+    expect(f).toMatchObject({ severity: 'hint', file: 'svc/Dockerfile' });
+    expect(f!.problem).toContain('no container deploy target is visible');
+    expect(r.summary.failures).toBe(0);
+    expect(find(service({ ...code, Dockerfile: 'FROM node:22\n', 'docker-compose.prod.yml': 'services:\n  svc:\n    build: .\n    environment:\n      - X=1\n' }), 'missing-from-build')[0]!.severity).toBe('error');
   });
 
   it('only suggests when no build configuration is visible', () => {
