@@ -1,0 +1,10 @@
+name: identity
+type: Backend Service
+
+secrets:
+  JWT_SECRET: /copilot/demo/${COPILOT_ENVIRONMENT_NAME}/secrets/IDENTITY_JWT_SECRET
+  SESSION_SECRET: /copilot/demo/${COPILOT_ENVIRONMENT_NAME}/secrets/SESSION_SECRET
+
+environments:
+  dev:
+  prod:

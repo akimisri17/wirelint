@@ -1,0 +1,13 @@
+name: gateway
+type: Load Balanced Web Service
+secrets:
+  GATEWAY_INTERNAL_KEY: /gateway/GATEWAY_INTERNAL_KEY
+environments:
+  dev:
+    variables:
+      IDENTITY_URL: http://identity-api.dev.internal.example.test
+    secrets:
+      JWT_SECRET: /gateway/dev/JWT_SECRET
+  prod:
+    variables:
+      LOG_FORMAT: json

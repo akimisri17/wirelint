@@ -1,0 +1,14 @@
+name: billing-api
+type: Backend Service
+
+secrets:
+  DATABASE_URL: /copilot/shop/prod/secrets/BILLING_DATABASE_URL
+  JWT_SECRET: /copilot/shop/prod/secrets/BILLING_JWT_SECRET
+  ORDERS_SERVICE_KEY: /copilot/shop/prod/secrets/INTERNAL_SERVICE_KEY
+  STRIPE_SECRET_KEY: /copilot/shop/prod/secrets/STRIPE_SECRET_KEY
+
+environments:
+  prod:
+    variables:
+      TAX_RATE: "0.2"
+      DOCS_ORIGIN: https://billing-preview.example.test

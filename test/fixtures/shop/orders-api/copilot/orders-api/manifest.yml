@@ -1,0 +1,24 @@
+name: orders-api
+type: Load Balanced Web Service
+
+image:
+  build: Dockerfile
+  port: 4001
+
+variables:
+  BILLING_API_URL: https://billing.example.test
+  SENTRY_DSN: https://key@sentry.example.test/1
+
+secrets:
+  DATABASE_URL: /copilot/shop/${COPILOT_ENVIRONMENT_NAME}/secrets/ORDERS_DATABASE_URL
+  JWT_SECRET: /copilot/shop/${COPILOT_ENVIRONMENT_NAME}/secrets/ORDERS_JWT_SECRET
+
+environments:
+  dev:
+    variables:
+      MAILER_URL: https://mailer-dev.example.test
+    secrets:
+      INTERNAL_SERVICE_KEY: /copilot/shop/dev/secrets/INTERNAL_SERVICE_KEY
+  prod:
+    variables:
+      MAILER_URL: https://mailer.example.test/   # trailing slash

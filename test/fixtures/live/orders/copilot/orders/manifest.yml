@@ -1,0 +1,18 @@
+name: orders
+type: Load Balanced Web Service
+
+secrets:
+  JWT_SECRET: /copilot/${COPILOT_APPLICATION_NAME}/${COPILOT_ENVIRONMENT_NAME}/secrets/JWT_SECRET
+  SIGNING_KEY: /copilot/demo/${COPILOT_ENVIRONMENT_NAME}/secrets/SIGNING_KEY
+  PAYMENTS_KEY:
+    secretsmanager: 'demo/${COPILOT_ENVIRONMENT_NAME}/payments'
+
+environments:
+  dev:
+    variables:
+      IDENTITY_URL: https://identity.dev.demo.example.test
+  prod:
+    variables:
+      IDENTITY_URL: https://identity.demo.example.test
+    secrets:
+      SIGNING_KEY: arn:aws:ssm:eu-west-1:000000000000:parameter/demo/prod/SIGNING_KEY

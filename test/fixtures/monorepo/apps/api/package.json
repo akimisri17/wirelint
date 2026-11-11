@@ -1,0 +1,1 @@
+{ "name": "@acme/api", "private": true, "scripts": { "dev": "PORT=5001 tsx src/index.ts" } }
