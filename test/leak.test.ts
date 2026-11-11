@@ -27,7 +27,7 @@ function secretCloud(): FakeCloud {
     p[`/copilot/demo/${env}/secrets/SESSION_SECRET`] = LEAK(`session-${env}`);
   }
   p['/copilot/demo/dev/secrets/SIGNING_KEY'] = LEAK('signing-dev');
-  return fakeCloud({
+  const cloud = fakeCloud({
     params: { 'eu-west-1': p },
     projects: {
       prj_demoweb0000: [
@@ -37,6 +37,9 @@ function secretCloud(): FakeCloud {
       ],
     },
   });
+  // Probe hosts resolve to a public documentation address, so probes really run.
+  cloud.lookup = async () => ['203.0.113.10'];
+  return cloud;
 }
 
 const ALL = ['--live', 'ssm,vercel', '--compare', '--probe', fixture('live')];
@@ -87,6 +90,32 @@ describe('leaks', () => {
     let rejected: unknown = null;
     await check(fixture('live'), new Set(), { live: { adapters: ['ssm', 'vercel'], compare: true, env: ENV }, probe: { path: '/health', timeoutMs: 1000, strict: true } }, cloud).catch((e: unknown) => (rejected = e));
     expect(rejected).toBeNull();
+  });
+
+  it('shows nothing from malformed answers whose elements carry values', async () => {
+    const cloud = secretCloud();
+    cloud.intercept = (c) => {
+      if (c.target === 'AmazonSSM.DescribeParameters') return Response.json({ Parameters: [LEAK('describe-element'), { Name: { v: LEAK('name-object') } }] });
+      if (c.target === 'AmazonSSM.GetParameters') return Response.json({ Parameters: [{ Name: LEAK('get-name'), Value: 42 }, LEAK('get-element')], InvalidParameters: [{ n: LEAK('invalid') }] });
+      if (c.url.pathname.startsWith('/v10/')) return Response.json({ envs: [LEAK('env-element'), { id: 1, key: LEAK('key'), target: LEAK('target'), value: LEAK('list-value') }], pagination: { count: 2, next: { t: LEAK('next') }, prev: null } });
+      if (c.url.pathname.startsWith('/v1/')) return Response.json([LEAK('one-array')]);
+      return undefined;
+    };
+    assertClean(await everyOutput(cloud), cloud);
+  });
+
+  it('shows nothing from an unexpected exception, in any output', async () => {
+    const cloud = secretCloud();
+    cloud.intercept = (c) => (c.url.host.endsWith('demo.example.test') ? undefined : new Response('busy', { status: 503 }));
+    cloud.sleep = async () => {
+      throw new Error(`unexpected ${LEAK('exception')}`);
+    };
+    cloud.lookup = async () => {
+      throw new RangeError(`unexpected ${LEAK('lookup-exception')}`);
+    };
+    const text = await everyOutput(cloud);
+    expect(text).not.toMatch(/\bat .+:\d+:\d+/);
+    assertClean(text, cloud);
   });
 
   it('shows nothing from a non-JSON or truncated answer', async () => {
