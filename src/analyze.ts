@@ -5,7 +5,7 @@ import { discoverServices } from './discover.js';
 import { readText, rel, walkSources } from './fsutil.js';
 import { isBaseUrlVar, isListVar, isLocationVar, isPlatformVar, isProdName, isProvidedByTarget, isSecretLooking, isVendorVar } from './names.js';
 import { scanSource } from './reads.js';
-import type { Annotation, AnnotationKind, BuildConfig, DeclaredVar, DeployTarget, Edge, EnvRead, Finding, ReadKind, Relation, Service, Severity, ShapeCode } from './types.js';
+import type { Annotation, AnnotationKind, BuildConfig, DeclaredVar, DeployTarget, Edge, EnvRead, FallbackChain, Finding, ReadKind, Relation, Service, Severity, ShapeCode } from './types.js';
 import { isPlaceholder, redact } from './url.js';
 
 export interface Analysis {
@@ -53,6 +53,7 @@ function loadServices(workspace: string): Service[] {
       badSuppressions: [],
       annotations: [],
       badAnnotations: [],
+      chains: [],
       build: [],
       filesScanned: 0,
     };
@@ -71,6 +72,7 @@ function loadServices(workspace: string): Service[] {
       const scan = scanSource(text);
       const file = rel(workspace, abs);
       for (const r of scan.reads) svc.reads.push({ ...r, file });
+      for (const c of scan.chains) svc.chains.push({ ...c, file });
       for (const line of scan.dynamic) svc.dynamicReads.push({ file, line });
       for (const p of scan.ports) fromSource.add(p);
     }
@@ -113,6 +115,22 @@ function usesOf(svc: Service): Map<string, VarUse> {
     uses.set(name, { name, kind: first.kind, first });
   }
   return uses;
+}
+
+/** One verdict per distinct chain, picked the same way as for a single variable. */
+function chainsOf(svc: Service): FallbackChain[] {
+  const byKey = new Map<string, FallbackChain[]>();
+  for (const c of svc.chains) {
+    const key = c.names.join('|');
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key)!.push(c);
+  }
+  return [...byKey.values()]
+    .map((all) => {
+      const pick = (k: ReadKind) => all.find((c) => c.kind === k);
+      return pick('required') ?? pick('localdefault') ?? pick('default') ?? pick('flag') ?? all[0]!;
+    })
+    .sort((a, b) => a.names.join('|').localeCompare(b.names.join('|')));
 }
 
 /** Annotation words per variable. */
@@ -296,6 +314,10 @@ export function analyze(workspaceArg: string): Analysis {
     const deployTargets = deployTargetsOf(svc);
     /** `name|file|env` already reported missing, so a later check does not repeat it. */
     const reported = new Set<string>();
+    const individually = (name: string) => {
+      const u = uses.get(name);
+      return !!u && u.kind !== 'default' && u.kind !== 'flag' && !runtimeExempt(name);
+    };
     for (const target of deployTargets) {
       for (const u of active) {
         if (u.kind === 'default' || u.kind === 'flag' || runtimeExempt(u.name)) continue;
@@ -322,6 +344,34 @@ export function analyze(workspaceArg: string): Analysis {
             `read in ${u.first.file}:${u.first.line} (${KIND_NOTE[u.kind]}) but not set for ${envLabel}` +
             (u.kind === 'localdefault' ? '; once deployed it silently points at localhost' : ''),
           fix: fixForTarget(target, u.name, everywhere ? null : missing),
+        });
+      }
+
+      // A fallback chain is satisfied when any member is set. Members that are
+      // checked on their own (read somewhere without a fallback) are covered above.
+      for (const c of chainsOf(svc)) {
+        if (c.kind === 'default' || c.kind === 'flag') continue;
+        if (c.names.some((n) => isPlatformVar(n) || individually(n) || runtimeExempt(n) || svc.suppress.has(n))) continue;
+        const set = (n: string, vars: Map<string, DeclaredVar>) => vars.has(n) || svc.baked.has(n) || isProvidedByTarget(target.kind, n);
+        const checkable = target.envs.filter((e) => !e.opaque);
+        const missing = checkable.filter((e) => !c.names.some((n) => set(n, e.vars))).map((e) => e.name);
+        if (missing.length === 0) continue;
+        const everywhere = missing.length === checkable.length;
+        const envLabel =
+          missing[0] === '*' ? 'any environment'
+          : everywhere && missing.length > 1 ? `any environment (${missing.join(', ')})`
+          : `environment${missing.length > 1 ? 's' : ''} ${missing.join(', ')}`;
+        const hard = c.kind !== 'plain' || c.names.some((n) => inExample.has(n));
+        push(svc, {
+          check: 'missing-from-deploy',
+          severity: hard ? 'error' : 'hint',
+          variable: c.names.join(' | '),
+          file: target.file,
+          env: missing.join(','),
+          problem:
+            `fallback chain ${c.names.join(' -> ')} read in ${c.file}:${c.line} (${KIND_NOTE[c.kind]}), but none of them is set for ${envLabel}` +
+            (c.kind === 'localdefault' ? '; once deployed it silently points at localhost' : ''),
+          fix: `${fixForTarget(target, c.names[0]!, everywhere ? null : missing)}; any one of ${c.names.join(', ')} satisfies the chain`,
         });
       }
     }

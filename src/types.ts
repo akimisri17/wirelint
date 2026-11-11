@@ -123,6 +123,16 @@ export interface Relation {
   compared: 'existence';
 }
 
+/** Variables read through a fallback chain such as `A ?? B ?? 'http://localhost'`. */
+export interface FallbackChain {
+  /** Members in the order the code tries them. */
+  names: string[];
+  file: string;
+  line: number;
+  /** How the code copes when every member is unset. */
+  kind: ReadKind;
+}
+
 /** Names visible to a build: Dockerfile ARG/ENV, compose build.args, vercel.json build.env. */
 export interface BuildConfig {
   kind: 'dockerfile' | 'compose' | 'vercel';
@@ -153,6 +163,7 @@ export interface Service {
   badSuppressions: { file: string; line: number; name?: string }[];
   annotations: Annotation[];
   badAnnotations: { file: string; line: number; name?: string; problem: string; fix: string }[];
+  chains: FallbackChain[];
   build: BuildConfig[];
   filesScanned: number;
 }

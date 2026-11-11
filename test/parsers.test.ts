@@ -247,3 +247,22 @@ describe('name rules', () => {
     for (const n of ['NEXT_PUBLIC_MAPS_KEY', 'TOKEN_TTL', 'JWT_EXPIRES_IN', 'KEYCLOAK_URL', 'API_URL']) expect(isSecretLooking(n), n).toBe(false);
   });
 });
+
+describe('fallback chains', () => {
+  it('finds chains across env reads and classifies the chain as a whole', () => {
+    const scan = scanSource(`
+      const a = process.env.A_ONE ?? process.env.A_TWO ?? 'http://localhost:1';
+      const b = process.env['B_ONE'] || process.env.B_TWO;
+      const c = (process.env.C_ONE ?? process.env.C_TWO) ?? 'https://c.example.test';
+      const d = process.env.D_ONE ?? other ?? process.env.D_TWO;
+      const e = process.env.E_ONE ?? process.env.E_ONE;
+    `);
+    expect(scan.chains).toEqual([
+      { names: ['A_ONE', 'A_TWO'], line: 2, kind: 'localdefault' },
+      { names: ['B_ONE', 'B_TWO'], line: 3, kind: 'plain' },
+      { names: ['C_ONE', 'C_TWO'], line: 4, kind: 'default' },
+    ]);
+    // Each member keeps the kind v0 gave it.
+    expect(Object.fromEntries(scan.reads.map((r) => [r.name, r.kind]))).toMatchObject({ A_ONE: 'default', A_TWO: 'default', B_ONE: 'default', B_TWO: 'default' });
+  });
+});

@@ -106,9 +106,14 @@ function kindFromContext(text: string, start: number, end: number): ReadKind {
 
 export interface ScanResult {
   reads: Omit<EnvRead, 'file' | 'tooling'>[];
+  /** `A ?? B ?? 'x'` and `A || B`: two or more env reads joined by a fallback operator. */
+  chains: { names: string[]; line: number; kind: ReadKind }[];
   dynamic: number[];
   ports: number[];
 }
+
+/** Only an operator (and parentheses or `this.`) between two reads makes them one chain. */
+const CHAIN_GAP = /^[\s()]*(\|\||\?\?)[\s(]*$/;
 
 export function scanSource(source: string): ScanResult {
   const text = stripComments(source);
@@ -127,6 +132,7 @@ export function scanSource(source: string): ScanResult {
 
   const reads: ScanResult['reads'] = [];
   const dynamic: number[] = [];
+  const spans: { name: string; start: number; end: number }[] = [];
   const add = (name: string, offset: number, kind: ReadKind, schema = false): void => {
     reads.push({ name, line: lineOf(offset), kind, schema });
   };
@@ -135,11 +141,14 @@ export function scanSource(source: string): ScanResult {
   if (/process\.env|import\.meta\.env|Bun\.env/.test(text)) {
     for (DOT_RE.lastIndex = 0; (m = DOT_RE.exec(text)); ) {
       add(m[1]!, m.index, kindFromContext(text, m.index, m.index + m[0].length));
+      spans.push({ name: m[1]!, start: m.index, end: m.index + m[0].length });
     }
     for (BRACKET_RE.lastIndex = 0; (m = BRACKET_RE.exec(text)); ) {
       const name = m[2]!;
-      if (new RegExp(`^${NAME}$`).test(name)) add(name, m.index, kindFromContext(text, m.index, m.index + m[0].length));
-      else dynamic.push(lineOf(m.index));
+      if (new RegExp(`^${NAME}$`).test(name)) {
+        add(name, m.index, kindFromContext(text, m.index, m.index + m[0].length));
+        spans.push({ name, start: m.index, end: m.index + m[0].length });
+      } else dynamic.push(lineOf(m.index));
     }
     for (DYNAMIC_RE.lastIndex = 0; (m = DYNAMIC_RE.exec(text)); ) dynamic.push(lineOf(m.index));
     for (DESTRUCTURE_RE.lastIndex = 0; (m = DESTRUCTURE_RE.exec(text)); ) {
@@ -191,6 +200,26 @@ export function scanSource(source: string): ScanResult {
     }
   }
 
+  // Fallback chains. Each member keeps its own (optional) kind; the chain as a
+  // whole is classified by what surrounds it, as if it were a single read.
+  const chains: ScanResult['chains'] = [];
+  spans.sort((a, b) => a.start - b.start);
+  for (let i = 0; i < spans.length; ) {
+    let j = i;
+    while (j + 1 < spans.length && CHAIN_GAP.test(text.slice(spans[j]!.end, spans[j + 1]!.start).replace(/\bthis\s*\.\s*/g, ''))) j++;
+    if (j > i) {
+      const members = spans.slice(i, j + 1);
+      const names = [...new Set(members.map((x) => x.name))];
+      if (names.length > 1) {
+        const last = members[members.length - 1]!;
+        // A closing parenthesis right after the chain belongs to it: `(A ?? B) ?? 'x'`.
+        const close = /^\s*\)*/.exec(text.slice(last.end))![0].length;
+        chains.push({ names, line: lineOf(members[0]!.start), kind: kindFromContext(text, members[0]!.start, last.end + close) });
+      }
+    }
+    i = j + 1;
+  }
+
   const ports: number[] = [];
   const portRes = [
     /\bprocess\.env\.PORT\s*(?:\|\||\?\?)\s*['"`]?(\d{2,5})/g,
@@ -199,5 +228,5 @@ export function scanSource(source: string): ScanResult {
   ];
   for (const re of portRes) for (; (m = re.exec(text)); ) ports.push(Number(m[1]));
 
-  return { reads, dynamic: [...new Set(dynamic)].sort((x, y) => x - y), ports };
+  return { reads, chains, dynamic: [...new Set(dynamic)].sort((x, y) => x - y), ports };
 }

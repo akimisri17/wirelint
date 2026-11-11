@@ -72,6 +72,7 @@ describe('fixture: annotations and a fallback chain', () => {
       [
         'error annotation-invalid web FEATURE_FLAGS',
         'error missing-from-build gateway BUILD_SHA',
+        'error missing-from-deploy gateway IDENTITY_URL | IDENTITY_API_URL',
         'error same-as-not-deployed gateway JWT_SECRET',
         'error same-as-undeclared gateway GATEWAY_INTERNAL_KEY',
         'error same-as-unknown-service web SESSION_SECRET',
@@ -79,7 +80,7 @@ describe('fixture: annotations and a fallback chain', () => {
         'hint missing-from-example gateway IDENTITY_API_URL',
       ].sort(),
     );
-    expect(report.summary).toMatchObject({ failures: 5, suggestions: 2 });
+    expect(report.summary).toMatchObject({ failures: 6, suggestions: 2 });
   });
 
   it('keeps declared relations in the report and drops the shared-secret guess they replace', () => {
@@ -232,5 +233,36 @@ describe('build-time', () => {
     const r = service(code);
     expect(find(r, 'missing-from-build')[0]).toMatchObject({ severity: 'hint', file: 'svc/.env.example', line: 1 });
     expect(r.summary.failures).toBe(0);
+  });
+});
+
+describe('fallback chains across several variables', () => {
+  const chain = "export const u = process.env.ORDERS_URL ?? process.env.ORDERS_API_URL ?? 'http://localhost:4001';";
+  const example = 'ORDERS_URL=http://localhost:4001\nORDERS_API_URL=http://localhost:4001\n';
+
+  it('is satisfied when any member is set', () => {
+    const r = service({ 'src/a.ts': chain, '.env.example': example, 'copilot/svc/manifest.yml': manifest('svc', 'environments:\n  dev:\n    variables:\n      ORDERS_URL: https://o.example.test\n  prod:\n    variables:\n      ORDERS_API_URL: https://o.example.test\n') });
+    expect(find(r, 'missing-from-deploy')).toEqual([]);
+  });
+
+  it('reports once, naming every member, when none is set', () => {
+    const r = service({ 'src/a.ts': chain, '.env.example': example, 'copilot/svc/manifest.yml': manifest('svc', 'environments:\n  dev:\n    variables:\n      ORDERS_URL: https://o.example.test\n  prod:\n    variables:\n      X: "1"\n') });
+    const all = find(r, 'missing-from-deploy');
+    expect(all).toHaveLength(1);
+    expect(all[0]).toMatchObject({ severity: 'error', variable: 'ORDERS_URL | ORDERS_API_URL', env: 'prod' });
+    expect(all[0]!.problem).toContain('none of them is set for environment prod; once deployed it silently points at localhost');
+    expect(all[0]!.fix).toBe('add ORDERS_URL to environments.prod.variables; any one of ORDERS_URL, ORDERS_API_URL satisfies the chain');
+  });
+
+  it('grades a chain like a single read', () => {
+    const files = (src: string) => ({ 'src/a.ts': src, '.env.example': 'X=1\n', 'copilot/svc/manifest.yml': manifest('svc', 'variables:\n  X: "1"\n') });
+    expect(find(service(files("process.env.A_URL || process.env.B_URL || 'https://fallback.example.test';")), 'missing-from-deploy')).toEqual([]);
+    expect(find(service(files('const v = process.env.A_KEY ?? process.env.B_KEY;')), 'missing-from-deploy').map((f) => f.severity)).toEqual(['hint']);
+    expect(find(service(files('const v = (process.env.A_KEY || process.env.B_KEY)!;')), 'missing-from-deploy').map((f) => f.severity)).toEqual(['error']);
+  });
+
+  it('leaves a member that is also read on its own to the single-variable check', () => {
+    const r = service({ 'src/a.ts': chain + "\ncfg.getOrThrow('ORDERS_URL');", '.env.example': example, 'copilot/svc/manifest.yml': manifest('svc', 'variables:\n  X: "1"\n') });
+    expect(find(r, 'missing-from-deploy').map((f) => f.variable)).toEqual(['ORDERS_URL']);
   });
 });
