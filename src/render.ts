@@ -52,7 +52,8 @@ export function renderHuman(report: Report, opts: { width?: number; hints?: bool
   const errors = report.findings.filter((f) => f.severity === 'error');
   const hints = report.findings.filter((f) => f.severity === 'hint');
   const notes = report.findings.filter((f) => f.severity === 'info');
-  const incomplete = (report.live?.adapters ?? []).filter((a) => !a.complete);
+  const incomplete: { adapter: string; problem?: string; fix?: string }[] = (report.live?.adapters ?? []).filter((a) => !a.complete);
+  if (report.probe && !report.probe.complete) incomplete.push({ adapter: 'probe', problem: report.probe.problem, fix: report.probe.fix });
   if (incomplete.length) {
     out.push('', `LIVE CHECK INCOMPLETE: ${incomplete.map((a) => a.adapter).join(', ')} did not run in full, so a pass here proves nothing about ${incomplete.length === 1 ? 'it' : 'them'}`);
     for (const a of incomplete) out.push(`  ${a.adapter}: ${a.problem}`, `    fix: ${a.fix}`);
@@ -119,6 +120,7 @@ export function renderHuman(report: Report, opts: { width?: number; hints?: bool
 }
 
 function liveLine(report: Report, a: LiveAdapterStatus): string {
+  if (a.adapter === 'compare') return `${a.checked} pair${a.checked === 1 ? '' : 's'} compared${a.complete ? '' : '; INCOMPLETE'}`;
   const checks = report.live!.checks.filter((c) => c.adapter === a.adapter);
   const n = (status: string) => checks.filter((c) => c.status === status).length;
   const unit = a.adapter === 'ssm' ? 'parameter references' : 'variables';
@@ -191,7 +193,9 @@ export function renderMarkdown(report: Report): string {
     : skipped.length ? `not fully checked; ${plural} in the part that was checked`
     : `${plural} in this change`;
   out.push(`### wirelint: ${headline}`, '');
-  for (const a of (report.live?.adapters ?? []).filter((x) => !x.complete)) {
+  const notRun: { adapter: string; problem?: string; fix?: string }[] = (report.live?.adapters ?? []).filter((x) => !x.complete);
+  if (report.probe && !report.probe.complete) notRun.push({ adapter: 'probe', problem: report.probe.problem, fix: report.probe.fix });
+  for (const a of notRun) {
     out.push(`> **Live check ${mdCode(a.adapter)} incomplete:** ${mdText(a.problem ?? '')}. **Fix:** ${mdText(a.fix ?? '')}`, '');
   }
   if (skipped.length) {
@@ -239,7 +243,9 @@ export function renderGithub(report: Report, repoRoot: string): string {
     props.push(`title=${escProp(`wirelint ${f.check}: ${f.variable}`)}`);
     lines.push(`::${level} ${props.join(',')}::${escData(`[${f.service}] ${f.variable} ${f.problem}. Fix: ${f.fix}`)}`);
   }
-  for (const a of (report.live?.adapters ?? []).filter((x) => !x.complete)) {
+  const notRun: { adapter: string; problem?: string; fix?: string }[] = (report.live?.adapters ?? []).filter((x) => !x.complete);
+  if (report.probe && !report.probe.complete) notRun.push({ adapter: 'probe', problem: report.probe.problem, fix: report.probe.fix });
+  for (const a of notRun) {
     lines.push(`::warning title=${escProp(`wirelint live check ${a.adapter} incomplete`)}::${escData(`${a.problem}. Fix: ${a.fix}`)}`);
   }
   return lines.join('\n');

@@ -97,7 +97,7 @@ function ssm(cloud: FakeCloud, call: Call): Response {
 function vercel(cloud: FakeCloud, call: Call): Response {
   if (call.method !== 'GET') return reply(405, { error: { code: 'method_not_allowed', message: 'read-only fake' } });
   if (call.headers['authorization'] !== `Bearer ${cloud.vercelToken}`) return reply(401, { error: { code: 'forbidden', message: 'Not authorized', invalidToken: true } });
-  const list = /^\/v9\/projects\/([^/]+)\/env$/.exec(call.url.pathname);
+  const list = /^\/v10\/projects\/([^/]+)\/env$/.exec(call.url.pathname);
   const one = /^\/v1\/projects\/([^/]+)\/env\/([^/]+)$/.exec(call.url.pathname);
   const id = decodeURIComponent((list ?? one)?.[1] ?? '');
   const envs = cloud.projects[id];

@@ -68,7 +68,7 @@ describe('--compare', () => {
     const [hint] = find(report, 'live-mismatch', 'SESSION_SECRET');
     expect(hint).toMatchObject({ severity: 'hint', service: 'identity + web', env: 'prod' });
     expect(hint!.fix).toContain('add "# wirelint: same-as web" to SESSION_SECRET in the .env.example of identity');
-    expect(net.calls.filter((c) => c.url.host === 'api.vercel.com').map((c) => `${c.method} ${c.url.pathname}`)).toEqual(['GET /v9/projects/prj_demoweb0000/env', 'GET /v1/projects/prj_demoweb0000/env/env_9']);
+    expect(net.calls.filter((c) => c.url.host === 'api.vercel.com').map((c) => `${c.method} ${c.url.pathname}`)).toEqual(['GET /v10/projects/prj_demoweb0000/env', 'GET /v1/projects/prj_demoweb0000/env/env_9']);
   });
 
   it('reports a sensitive Vercel variable as existence only, without asking for it', async () => {
@@ -96,9 +96,13 @@ describe('--compare', () => {
     const d = new Digester();
     expect(JSON.stringify({ d })).toBe('{"d":"[Digester]"}');
     expect(inspect(d)).toBe('[Digester]');
-    expect(Digester.same(d.digest('a'), d.digest('a'))).toBe(true);
-    expect(Digester.same(d.digest('a'), d.digest('b'))).toBe(false);
+    expect(Digester.same(d.digest('a').exact, d.digest('a').exact)).toBe(true);
+    expect(Digester.same(d.digest('a').exact, d.digest('b').exact)).toBe(false);
     // A different run has a different key, so digests are not comparable across runs.
-    expect(Digester.same(d.digest('a'), new Digester().digest('a'))).toBe(false);
+    expect(Digester.same(d.digest('a').exact, new Digester().digest('a').exact)).toBe(false);
+    // The trimmed digest ignores exactly one trailing newline, and nothing else.
+    expect(Digester.same(d.digest('a\n').exact, d.digest('a').exact)).toBe(false);
+    expect(Digester.same(d.digest('a\r\n').trimmed, d.digest('a').trimmed)).toBe(true);
+    expect(Digester.same(d.digest('a ').trimmed, d.digest('a').trimmed)).toBe(false);
   });
 });

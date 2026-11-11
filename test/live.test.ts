@@ -30,8 +30,8 @@ describe('no network without a v2 flag', () => {
 describe('manifest secret references', () => {
   it('interpolates Copilot variables and reads SSM ARNs', () => {
     expect(resolveRef('/copilot/${COPILOT_APPLICATION_NAME}/${COPILOT_ENVIRONMENT_NAME}/x', 'prod', 'demo', 'eu-west-1')).toEqual({ name: '/copilot/demo/prod/x', region: 'eu-west-1' });
-    expect(resolveRef('arn:aws:ssm:us-east-2:000000000000:parameter/a/b', 'prod', null, 'eu-west-1')).toEqual({ name: '/a/b', region: 'us-east-2' });
-    expect(resolveRef('arn:aws:ssm:us-east-2:000000000000:parameter/flat', 'prod', null, 'eu-west-1')).toEqual({ name: 'flat', region: 'us-east-2' });
+    expect(resolveRef('arn:aws:ssm:us-east-2::parameter/a/b', 'prod', null, 'eu-west-1')).toEqual({ name: '/a/b', region: 'us-east-2' });
+    expect(resolveRef('arn:aws:ssm:us-east-2::parameter/flat', 'prod', null, 'eu-west-1')).toEqual({ name: 'flat', region: 'us-east-2' });
     expect(resolveRef('PLAIN_NAME', '*', null, 'eu-west-1')).toEqual({ name: 'PLAIN_NAME', region: 'eu-west-1' });
   });
 
@@ -43,23 +43,37 @@ describe('manifest secret references', () => {
     expect(reason('/x/${COPILOT_ENVIRONMENT_NAME}', '*')).toMatch(/names no environment/);
     expect(reason('/x/${COPILOT_APPLICATION_NAME}', 'prod', null)).toMatch(/copilot\/.workspace/);
     expect(reason('/x/${OTHER}')).toMatch(/cannot resolve/);
+    // An account wirelint cannot verify makes "not found" meaningless: not checked, never missing.
+    expect(reason('arn:aws:ssm:eu-west-1:000000000000:parameter/a/b')).toBe('is an SSM ARN in a named account, and wirelint does not verify which account the credentials belong to');
   });
 });
 
 describe('--live ssm', () => {
-  it('reports a referenced parameter that does not exist, per environment', async () => {
+  it('reports a referenced parameter that does not exist, per environment, as a failure with --env', async () => {
     const net = fakeCloud({ params: demoParams() });
-    const r = await cli(['--json', '--live', 'ssm', fixture('live')], { env: AWS, net });
+    const r = await cli(['--json', '--live', 'ssm', '--env', 'dev', fixture('live')], { env: AWS, net });
     expect(r.code).toBe(1);
     const report = json(r);
-    expect(find(report, 'live-missing').map((f) => [f.service, f.variable, f.env, f.file])).toEqual([['orders', 'JWT_SECRET', 'dev', 'orders/copilot/orders/manifest.yml']]);
+    expect(find(report, 'live-missing').map((f) => [f.severity, f.service, f.variable, f.env, f.file])).toEqual([['error', 'orders', 'JWT_SECRET', 'dev', 'orders/copilot/orders/manifest.yml']]);
     expect(find(report, 'live-missing')[0]!.fix).toBe(
       'create the parameter that secrets.JWT_SECRET in orders/copilot/orders/manifest.yml names, in eu-west-1 (copilot secret init --name JWT_SECRET creates and tags it), or correct the reference',
     );
-    expect(report.live!.adapters).toEqual([{ adapter: 'ssm', complete: true, requests: 1, checked: 8 }]);
-    expect(report.live!.checks.filter((c) => c.status === 'present')).toHaveLength(7);
-    // The ARN override for prod is used instead of the top-level reference.
-    expect(report.live!.checks.find((c) => c.variable === 'SIGNING_KEY' && c.env === 'prod')).toMatchObject({ status: 'present' });
+    expect(report.live!.adapters).toEqual([{ adapter: 'ssm', complete: true, requests: 1, checked: 4 }]);
+  });
+
+  it('makes a not-found parameter a suggestion when several environments are checked with one set of credentials', async () => {
+    const net = fakeCloud({ params: demoParams() });
+    const r = await cli(['--json', '--live', 'ssm', fixture('live')], { env: AWS, net });
+    expect(r.code).toBe(0);
+    const report = json(r);
+    const [f] = find(report, 'live-missing');
+    expect(f).toMatchObject({ severity: 'hint', service: 'orders', variable: 'JWT_SECRET', env: 'dev' });
+    expect(f!.fix).toMatch(/^re-run with --env dev and the credentials \(and --region\) of environment dev to confirm; if it is still missing, create the parameter/);
+    expect(report.live!.adapters).toEqual([{ adapter: 'ssm', complete: true, requests: 1, checked: 7 }]);
+    expect(report.live!.checks.filter((c) => c.status === 'present')).toHaveLength(6);
+    // The prod ARN override names an account, so it is not checked rather than reported missing.
+    expect(report.live!.checks.find((c) => c.variable === 'SIGNING_KEY' && c.env === 'prod')).toMatchObject({ status: 'not-checked' });
+    expect(find(report, 'live-not-checked', 'SIGNING_KEY')[0]!.problem).toContain('environments.prod.secrets.SIGNING_KEY');
     // Secrets Manager references are notes, not failures.
     expect(find(report, 'live-not-checked', 'PAYMENTS_KEY').map((f) => [f.severity, f.env])).toEqual([['info', 'dev'], ['info', 'prod']]);
   });
@@ -77,7 +91,7 @@ describe('--live ssm', () => {
   it('follows NextToken across pages', async () => {
     const net = fakeCloud({ params: demoParams(), pageSize: 2 });
     const report = json(await cli(['--json', '--live', 'ssm', fixture('live')], { env: AWS, net }));
-    expect(net.calls.length).toBe(4);
+    expect(net.calls.length).toBe(3);
     expect(net.calls.slice(1).every((c) => typeof c.body!['NextToken'] === 'string')).toBe(true);
     expect(find(report, 'live-missing')).toHaveLength(1);
     expect(report.live!.complete).toBe(true);
@@ -165,11 +179,11 @@ describe('--live ssm', () => {
 
   it('carries live findings into GitHub annotations and the Markdown body', async () => {
     const net = fakeCloud({ params: demoParams() });
-    const report = json(await cli(['--json', '--live', 'ssm', fixture('live')], { env: AWS, net }));
+    const report = json(await cli(['--json', '--live', 'ssm', '--env', 'dev', fixture('live')], { env: AWS, net }));
     expect(renderGithub(report, fixture('live'))).toContain('::error file=orders/copilot/orders/manifest.yml,title=wirelint live-missing%3A JWT_SECRET::');
     expect(renderMarkdown(report)).toContain('- `orders` `JWT_SECRET` `orders/copilot/orders/manifest.yml`: secrets.JWT\\_SECRET references an SSM parameter that does not exist');
     expect(renderMarkdown(report)).toContain('files plus read-only live checks');
-    expect(renderHuman(report)).toContain('ssm: 7 present, 1 missing, 2 not checked (1 request)');
+    expect(renderHuman(report)).toContain('ssm: 3 present, 1 missing, 1 not checked (1 request)');
   });
 });
 

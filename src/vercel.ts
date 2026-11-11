@@ -2,13 +2,16 @@ import { Http, safeCode, type HttpResult } from './net.js';
 
 /**
  * The Vercel REST API, read-only. Two GET endpoints only:
- *   GET /v9/projects/{id}/env         keys, targets and types, without decryption.
+ *   GET /v10/projects/{id}/env        keys, targets and types, without decryption.
  *                                     Any value field in the answer is dropped on parse.
  *   GET /v1/projects/{id}/env/{envId} one decrypted value, only for --compare. It goes
  *                                     straight into `digest` and is not kept.
  */
 
-export type VercelFailure = { failure: 'auth' | 'denied' | 'not-found' | 'throttled' | 'network' | 'other'; code?: string };
+export type VercelFailure = { failure: 'auth' | 'denied' | 'not-found' | 'throttled' | 'network' | 'hidden' | 'pagination' | 'other'; code?: string };
+
+const MALFORMED: VercelFailure = { failure: 'other', code: 'MalformedResponse' };
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
 /** A project variable as wirelint keeps it: no value. */
 export interface VercelVar {
@@ -53,46 +56,70 @@ export class Vercel {
     if (!r.ok) return { failure: 'network', code: r.kind };
     if (r.status < 200 || r.status >= 300) return failure(r);
     try {
-      return { json: JSON.parse(r.body) as Record<string, unknown> };
+      const json: unknown = JSON.parse(r.body);
+      return isObject(json) ? { json } : MALFORMED;
     } catch {
       return { failure: 'other', code: 'UnreadableResponse' };
     }
   }
 
-  /** Every variable of a project: keys, targets and types. Follows pagination.next. */
+  /**
+   * Every variable of a project: keys, targets and types.
+   *
+   * The documented answer (GET /v10/projects/{idOrName}/env) is either
+   * { envs, pagination: { count, next, prev } }, where `next` is "Timestamp
+   * that must be used to request the next page" or null, or { envs,
+   * hiddenProductionEnvCount }. The endpoint documents no query parameter
+   * for that timestamp; wirelint sends it as `until`, the convention of
+   * Vercel's other paginated endpoints. A page that brings no new ids while
+   * `next` is still set ends the listing as incomplete, never as complete.
+   */
   async list(projectId: string, teamId: string | undefined): Promise<VercelVar[] | VercelFailure> {
-    const out: VercelVar[] = [];
+    const out = new Map<string, VercelVar>();
     let until: string | undefined;
     for (let page = 0; ; page++) {
-      if (page >= 50) return { failure: 'other', code: 'PaginationLimit' };
-      const r = await this.get(`/v9/projects/${encodeURIComponent(projectId)}/env`, { teamId, until });
+      if (page >= 50) return { failure: 'pagination', code: 'PaginationLimit' };
+      const r = await this.get(`/v10/projects/${encodeURIComponent(projectId)}/env`, { teamId, until });
       if ('failure' in r) return r;
-      const envs = Array.isArray(r.json['envs']) ? r.json['envs'] : Array.isArray(r.json) ? (r.json as unknown[]) : [];
-      for (const raw of envs as Record<string, unknown>[]) {
-        if (typeof raw['key'] !== 'string' || typeof raw['id'] !== 'string') continue;
+      const envs = r.json['envs'];
+      if (!Array.isArray(envs) || !envs.every(isObject)) return MALFORMED;
+      let added = 0;
+      for (const raw of envs) {
         const target = raw['target'];
-        const targets = (Array.isArray(target) ? target : [target]).filter((t): t is string => typeof t === 'string');
-        out.push({ id: raw['id'], key: raw['key'], targets, type: typeof raw['type'] === 'string' ? raw['type'] : 'unknown', branchOnly: typeof raw['gitBranch'] === 'string' && raw['gitBranch'] !== '' });
+        const targets = Array.isArray(target) ? target : [target];
         delete raw['value'];
+        if (typeof raw['key'] !== 'string' || typeof raw['id'] !== 'string' || !targets.every((t) => typeof t === 'string')) return MALFORMED;
+        if (out.has(raw['id'])) continue;
+        added++;
+        out.set(raw['id'], { id: raw['id'], key: raw['key'], targets: targets as string[], type: typeof raw['type'] === 'string' ? raw['type'] : 'unknown', branchOnly: typeof raw['gitBranch'] === 'string' && raw['gitBranch'] !== '' });
       }
-      const next = (r.json['pagination'] as { next?: unknown } | undefined)?.next;
-      if ((typeof next !== 'number' && typeof next !== 'string') || next === '' || envs.length === 0) break;
+      const hidden = r.json['hiddenProductionEnvCount'];
+      if (typeof hidden === 'number' && hidden > 0) return { failure: 'hidden', code: 'HiddenProductionEnvs' };
+      const pagination = r.json['pagination'];
+      if (pagination !== undefined && !isObject(pagination)) return MALFORMED;
+      const next = pagination?.['next'];
+      if (next === undefined || next === null) break;
+      if (typeof next !== 'number' && typeof next !== 'string') return MALFORMED;
+      if (added === 0) return { failure: 'pagination', code: 'PaginationStalled' };
       until = String(next);
     }
-    return out;
+    return [...out.values()];
   }
 
   /**
    * The digest of one variable's decrypted value. Sensitive variables cannot
    * be read back, by design; they are reported as unreadable without a request.
    */
-  async digest(projectId: string, teamId: string | undefined, v: VercelVar, digest: (value: string) => Buffer): Promise<Buffer | 'unreadable' | VercelFailure> {
+  async digest<D>(projectId: string, teamId: string | undefined, v: VercelVar, digest: (value: string) => D): Promise<D | 'unreadable' | VercelFailure> {
     if (v.type === 'sensitive' || v.type === 'secret' || v.type === 'system') return 'unreadable';
     const r = await this.get(`/v1/projects/${encodeURIComponent(projectId)}/env/${encodeURIComponent(v.id)}`, { teamId });
     if ('failure' in r) return r;
     const value = r.json['value'];
     delete r.json['value'];
-    return typeof value === 'string' && r.json['decrypted'] !== false ? digest(value) : 'unreadable';
+    if (value !== undefined && typeof value !== 'string') return MALFORMED;
+    // Only a value the API says it decrypted (or a plain one) is a value; anything else may be ciphertext.
+    const readable = r.json['decrypted'] === true || (r.json['type'] ?? v.type) === 'plain';
+    return typeof value === 'string' && readable ? digest(value) : 'unreadable';
   }
 }
 
@@ -107,6 +134,10 @@ export function vercelProblem(f: VercelFailure, what: string): { problem: string
       return { problem: `${what} was not found for this token and team${code}`, fix: 'check projectId in .vercel/project.json (or --vercel-project) and the team (--vercel-team, VERCEL_TEAM_ID)' };
     case 'throttled':
       return { problem: `Vercel kept rate-limiting after retries${code}`, fix: 'run it again later' };
+    case 'hidden':
+      return { problem: `Vercel hid some production variables of ${what} from this token${code}`, fix: 'use a token whose role can see production environment variables' };
+    case 'pagination':
+      return { problem: `the variable list of ${what} did not page to the end${code}`, fix: 'run it again; if it persists, the list cannot be read in full and the check is not trustworthy' };
     case 'network':
       return { problem: `could not reach the Vercel API${code}`, fix: 'check network access to api.vercel.com' };
     default:

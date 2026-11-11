@@ -270,7 +270,8 @@ export type LiveAdapterName = 'ssm' | 'vercel';
 
 /** How one requested live adapter fared. `complete: false` makes the run exit 2 unless findings exit 1. */
 export interface LiveAdapterStatus {
-  adapter: LiveAdapterName;
+  /** A requested adapter, or `compare` for the --compare step itself. */
+  adapter: LiveAdapterName | 'compare';
   /** Every check this adapter planned ran to an answer. */
   complete: boolean;
   /** HTTP requests made, retries included. */
@@ -339,5 +340,11 @@ export interface ProbeSummary {
   path: string;
   timeoutMs: number;
   strict: boolean;
+  /** `--probe-allow-private`: non-public addresses were probed too. */
+  allowPrivate: boolean;
+  /** False when the probe run stopped on an unexpected error; the run then exits 2 unless findings exit 1. */
+  complete: boolean;
+  problem?: string;
+  fix?: string;
   results: ProbeResult[];
 }

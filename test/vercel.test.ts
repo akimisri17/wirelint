@@ -34,7 +34,7 @@ describe('--live vercel', () => {
   it('lists keys and targets with GET only, without asking for decryption', async () => {
     const net = project();
     await cli(['--live', 'vercel', fixture('live')], { env: { VERCEL_TOKEN: net.vercelToken }, net });
-    expect(net.calls.map((c) => `${c.method} ${c.url.pathname}${c.url.search}`)).toEqual(['GET /v9/projects/prj_demoweb0000/env?teamId=team_demo0000']);
+    expect(net.calls.map((c) => `${c.method} ${c.url.pathname}${c.url.search}`)).toEqual(['GET /v10/projects/prj_demoweb0000/env?teamId=team_demo0000']);
     expect(net.calls[0]!.headers['authorization']).toBe(`Bearer ${net.vercelToken}`);
   });
 
@@ -72,15 +72,16 @@ describe('--live vercel', () => {
     const net = project();
     const r = await cli(['--json', '--live', 'vercel', '--vercel-project', 'web=prj_other', '--vercel-team', 'team_flag', fixture('live')], { env: { VERCEL_TOKEN: net.vercelToken, VERCEL_TEAM_ID: 'team_env' }, net });
     expect(r.code).toBe(2);
-    expect(net.calls[0]!.url.pathname + net.calls[0]!.url.search).toBe('/v9/projects/prj_other/env?teamId=team_flag');
+    expect(net.calls[0]!.url.pathname + net.calls[0]!.url.search).toBe('/v10/projects/prj_other/env?teamId=team_flag');
     expect(json(r).live!.adapters[0]!.problem).toBe('the project linked in --vercel-project was not found for this token and team (not_found)');
   });
 
-  it('notes a Vercel service with no linked project instead of failing', async () => {
+  it('notes a Vercel service with no linked project, and a run with nothing checkable is incomplete', async () => {
     const ws = workspace({ 'site/package.json': pkg('site'), 'site/vercel.json': '{}', 'site/.env.example': 'API_URL=http://localhost:4000\n', 'site/src/a.ts': 'export const a = process.env.API_URL!;\n' });
     const net = fakeCloud();
     const r = await cli(['--json', '--live', 'vercel', ws], { env: { VERCEL_TOKEN: net.vercelToken }, net });
-    expect(r.code).toBe(0);
+    expect(r.code).toBe(2);
+    expect(json(r).live!.adapters[0]).toMatchObject({ complete: false, problem: 'no Vercel project is linked for any Vercel service, so there was nothing to check' });
     const note = find(json(r), 'live-not-checked')[0]!;
     expect(note).toMatchObject({ severity: 'info', service: 'site', file: 'site/vercel.json' });
     expect(note.fix).toBe('run "vercel link" in site to write .vercel/project.json, or pass --vercel-project site=<projectId>');

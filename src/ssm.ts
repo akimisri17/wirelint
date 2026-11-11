@@ -18,6 +18,16 @@ const AUTH = new Set([
 const DENIED = new Set(['AccessDeniedException', 'AccessDenied', 'UnauthorizedOperation']);
 const THROTTLED = new Set(['ThrottlingException', 'Throttling', 'TooManyRequestsException', 'RequestLimitExceeded', 'ThrottledException']);
 
+const MALFORMED: SsmFailure = { failure: 'other', code: 'MalformedResponse' };
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** The array under `key`, if every element is an object; null when the answer has another shape. */
+function objects(json: Record<string, unknown>, key: string): Record<string, unknown>[] | null {
+  const v = json[key];
+  if (v === undefined) return [];
+  return Array.isArray(v) && v.every(isObject) ? v : null;
+}
+
 export const REGION_RE = /^[a-z]{2}(-[a-z]+)+-\d{1,2}$/;
 
 export function endpoint(region: string): string {
@@ -72,7 +82,8 @@ export class Ssm {
     if (!r.ok) return { failure: 'network', code: r.kind };
     if (r.status >= 200 && r.status < 300) {
       try {
-        return { json: JSON.parse(r.body) as Record<string, unknown> };
+        const json: unknown = JSON.parse(r.body);
+        return isObject(json) ? { json } : MALFORMED;
       } catch {
         return { failure: 'other', code: 'UnreadableResponse' };
       }
@@ -102,11 +113,12 @@ export class Ssm {
           ...(token ? { NextToken: token } : {}),
         });
         if ('failure' in r) return r;
-        for (const p of Array.isArray(r.json['Parameters']) ? r.json['Parameters'] : []) {
-          const name = (p as { Name?: unknown }).Name;
-          if (typeof name === 'string' && batch.includes(name)) found.add(name);
-        }
-        token = typeof r.json['NextToken'] === 'string' && r.json['NextToken'] ? (r.json['NextToken'] as string) : undefined;
+        const params = objects(r.json, 'Parameters');
+        if (!params || params.some((p) => typeof p['Name'] !== 'string')) return MALFORMED;
+        for (const p of params) if (batch.includes(p['Name'] as string)) found.add(p['Name'] as string);
+        const next = r.json['NextToken'];
+        if (next !== undefined && next !== null && typeof next !== 'string') return MALFORMED;
+        token = next ? next : undefined;
         if (!token) break;
       }
     }
@@ -117,19 +129,21 @@ export class Ssm {
    * Digests of the values of `names` (GetParameters, 10 per request, with
    * decryption). The plaintext goes straight into `digest` and is dropped.
    */
-  async digests(region: string, names: string[], digest: (value: string) => Buffer): Promise<{ digests: Map<string, Buffer>; missing: Set<string> } | SsmFailure> {
-    const digests = new Map<string, Buffer>();
+  async digests<D>(region: string, names: string[], digest: (value: string) => D): Promise<{ digests: Map<string, D>; missing: Set<string> } | SsmFailure> {
+    const digests = new Map<string, D>();
     const missing = new Set<string>();
     for (let i = 0; i < names.length; i += 10) {
       const batch = names.slice(i, i + 10);
       const r = await this.call(region, 'GetParameters', { Names: batch, WithDecryption: true });
       if ('failure' in r) return r;
-      const params = Array.isArray(r.json['Parameters']) ? (r.json['Parameters'] as { Name?: unknown; Value?: unknown }[]) : [];
+      const params = objects(r.json, 'Parameters');
+      const invalid = r.json['InvalidParameters'] ?? [];
+      if (!params || params.some((p) => typeof p['Name'] !== 'string' || typeof p['Value'] !== 'string') || !Array.isArray(invalid) || !invalid.every((n) => typeof n === 'string')) return MALFORMED;
       for (const p of params) {
-        if (typeof p.Name === 'string' && typeof p.Value === 'string' && batch.includes(p.Name)) digests.set(p.Name, digest(p.Value));
-        p.Value = undefined;
+        if (batch.includes(p['Name'] as string)) digests.set(p['Name'] as string, digest(p['Value'] as string));
+        delete p['Value'];
       }
-      for (const n of Array.isArray(r.json['InvalidParameters']) ? r.json['InvalidParameters'] : []) if (typeof n === 'string') missing.add(n);
+      for (const n of invalid as string[]) missing.add(n);
     }
     return { digests, missing };
   }

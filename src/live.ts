@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { deployTargetsOf, requirementsOf, type Analysis, type SecretPair } from './analyze.js';
-import { Digester } from './compare.js';
+import { Digester, type Digest } from './compare.js';
 import { isFile, readJson, readText, rel } from './fsutil.js';
 import { Http, pool, type HttpOptions, type Net } from './net.js';
 import type { AwsCredentials } from './sigv4.js';
@@ -74,6 +74,8 @@ export interface ParamRef {
   region: string;
   /** The parameter name. Never rendered. */
   name: string;
+  /** The manifest names more than one environment, which may live in other accounts or regions. */
+  multiEnv: boolean;
 }
 
 /** The Copilot application name, from copilot/.workspace. */
@@ -101,8 +103,10 @@ export function resolveRef(ref: string, env: string, app: string | null, region:
     return { reason: 'is not an SSM parameter name' };
   }
   if (/^arn:[\w-]+:secretsmanager:/.test(r)) return { reason: 'references an AWS Secrets Manager ARN, which wirelint does not check' };
-  const arn = /^arn:[\w-]+:ssm:([a-z0-9-]+):\d*:parameter\/(.+)$/.exec(r);
-  let name = arn ? (arn[2]!.includes('/') ? `/${arn[2]}` : arn[2]!) : r;
+  const arn = /^arn:[\w-]+:ssm:([a-z0-9-]+):(\d*):parameter\/(.+)$/.exec(r);
+  // Nothing tells wirelint which account the credentials are in, so "not found" there would prove nothing.
+  if (arn && arn[2]) return { reason: 'is an SSM ARN in a named account, and wirelint does not verify which account the credentials belong to' };
+  let name = arn ? (arn[3]!.includes('/') ? `/${arn[3]}` : arn[3]!) : r;
   const where = arn && REGION_RE.test(arn[1]!) ? arn[1]! : region;
   if (name.includes('${COPILOT_ENVIRONMENT_NAME}')) {
     if (env === '*') return { reason: 'uses ${COPILOT_ENVIRONMENT_NAME}, but the manifest names no environment' };
@@ -126,6 +130,7 @@ function planSsm(a: Analysis, region: string, envs: string[] | undefined, sink: 
     for (const target of deployTargetsOf(svc)) {
       if (target.kind !== 'copilot') continue;
       const doc = asMap(parseYaml(readText(path.join(a.workspace, target.file)) ?? ''));
+      const multiEnv = target.envs.filter((e) => e.name !== '*').length > 1;
       for (const e of target.envs) {
         if (e.name !== '*') seenEnvs.add(e.name);
         if (envs && e.name !== '*' && !envs.includes(e.name)) continue;
@@ -148,7 +153,7 @@ function planSsm(a: Analysis, region: string, envs: string[] | undefined, sink: 
             });
             continue;
           }
-          refs.push({ svc, variable, file: target.file, env: e.name, where, ...resolved });
+          refs.push({ svc, variable, file: target.file, env: e.name, where, multiEnv, ...resolved });
         }
       }
     }
@@ -248,21 +253,33 @@ async function runSsm(ctx: LiveRun): Promise<void> {
       checks.push({ adapter: 'ssm', service: r.svc.name, variable: r.variable, file: r.file, env: r.env, status: present ? 'present' : 'missing' });
       if (present) continue;
       const envLabel = r.env === '*' ? 'its environment' : `environment ${r.env}`;
+      const create = `create the parameter that ${r.where} in ${r.file} names, in ${reg} (copilot secret init --name ${r.variable} creates and tags it), or correct the reference`;
+      // Copilot environments often live in different accounts or regions. Without --env, one set
+      // of credentials may simply be looking in the wrong place, so "not found" is not proof.
+      const unsure = r.multiEnv && !opts.envs;
       sink.push(r.svc, r.svc.name, {
         check: 'live-missing',
-        severity: 'error',
+        severity: unsure ? 'hint' : 'error',
         variable: r.variable,
         file: r.file,
         env: r.env,
-        problem: `${r.where} references an SSM parameter that does not exist in ${reg} for ${envLabel}; tasks that need it fail to start`,
-        fix: `create the parameter that ${r.where} in ${r.file} names, in ${reg} (copilot secret init --name ${r.variable} creates and tags it), or correct the reference`,
+        problem: unsure
+          ? `${r.where} references an SSM parameter that these credentials do not find in ${reg} for ${envLabel}; the manifest has several environments, which may live in other accounts or regions`
+          : `${r.where} references an SSM parameter that does not exist in ${reg} for ${envLabel}; tasks that need it fail to start`,
+        fix: unsure ? `re-run with --env ${r.env} and the credentials (and --region) of environment ${r.env} to confirm; if it is still missing, ${create}` : create,
       });
     }
   }
   status.requests = ctx.http.requests - before;
   if (!failed) ctx.ssmClient = ssm;
   if (failed) Object.assign(status, failed);
-  else if (unknownEnvs.length) {
+  else if (refs.length === 0 && !unknownEnvs.length) {
+    const skipped = checks.filter((c) => c.adapter === 'ssm' && c.status === 'not-checked').length;
+    status.problem = skipped
+      ? `none of the ${skipped} SSM reference${skipped === 1 ? '' : 's'} in the Copilot manifests could be checked (see NOT ANALYSED)`
+      : 'no Copilot manifest references an SSM parameter, so there was nothing to check';
+    status.fix = skipped ? 'resolve the references listed as not checked, or drop ssm from --live' : 'drop ssm from --live, or add the Copilot manifests that reference SSM parameters';
+  } else if (unknownEnvs.length) {
     status.problem = `--env ${unknownEnvs.join(', ')} matches no environment in any Copilot manifest`;
     status.fix = seenEnvs.size ? `use one of: ${[...seenEnvs].sort().join(', ')}` : 'drop --env; no Copilot manifest names an environment';
   } else status.complete = true;
@@ -315,8 +332,10 @@ async function runVercel(ctx: LiveRun): Promise<void> {
 
   const listed = await pool(deployed, 4, async (svc) => {
     const link = vercelLink(a, svc, opts);
-    if (!link) return { svc, link, vars: null };
-    return { svc, link, vars: authFailed ? null : await client.list(link.projectId, link.teamId) };
+    if (!link || authFailed) return { svc, link, vars: null };
+    const vars = await client.list(link.projectId, link.teamId);
+    if (!Array.isArray(vars) && vars.failure === 'auth') authFailed = true;
+    return { svc, link, vars };
   });
   for (const { svc, link, vars } of listed) {
     const svcRel = rel(a.workspace, svc.dir);
@@ -336,7 +355,6 @@ async function runVercel(ctx: LiveRun): Promise<void> {
     }
     if (!vars || !Array.isArray(vars)) {
       if (vars && !failed) failed = vercelProblem(vars, `the project linked in ${link.file}`);
-      if (vars && vars.failure === 'auth') authFailed = true;
       for (const r of reqs) checks.push({ adapter: 'vercel', service: svc.name, variable: label(r.names), file: link.file, env: 'production', status: 'not-checked', reason: 'the Vercel project could not be read' });
       continue;
     }
@@ -388,7 +406,10 @@ async function runVercel(ctx: LiveRun): Promise<void> {
   }
   status.requests = ctx.http.requests - before;
   if (failed) Object.assign(status, failed);
-  else status.complete = true;
+  else if (ctx.vercel.size === 0) {
+    status.problem = deployed.length ? 'no Vercel project is linked for any Vercel service, so there was nothing to check' : 'no service is deployed on Vercel (no vercel.json, .vercel/project.json or --vercel-project), so there was nothing to check';
+    status.fix = deployed.length ? 'run "vercel link" in each Vercel service, or pass --vercel-project <service>=<projectId>' : 'drop vercel from --live, or pass --vercel-project <service>=<projectId>';
+  } else status.complete = true;
 }
 
 /** Where one side of a comparison lives for one environment. In memory only. */
@@ -396,10 +417,21 @@ type Source =
   | { kind: 'ssm'; env: string; ref: ParamRef; key: string }
   | { kind: 'vercel'; env: string; svc: Service; project: VercelProject; v: VercelVar; key: string };
 
-type Fetched = Buffer | 'unreadable' | 'missing' | 'failed';
+type Fetched = Digest | 'unreadable' | 'missing' | 'failed';
 
-/** Copilot environments and Vercel targets meet on production; other names must match. */
-const canon = (src: Source): string => (src.kind === 'ssm' ? (src.env === '*' ? '*' : isProdName(src.env) ? 'production' : src.env) : src.env);
+/**
+ * Copilot environments and Vercel targets meet on production; every other
+ * name meets only itself. A manifest with no environments block (`*`) is
+ * treated as production only, never as a wildcard.
+ */
+const canon = (src: Source): string => (src.kind === 'ssm' ? (src.env === '*' || isProdName(src.env) ? 'production' : src.env) : src.env);
+
+/** Mark an adapter incomplete, keeping the first problem it reported. */
+function incomplete(status: LiveAdapterStatus | undefined, why: { problem: string; fix: string }): void {
+  if (!status) return;
+  if (status.complete || !status.problem) Object.assign(status, why);
+  status.complete = false;
+}
 
 function sourcesOf(ctx: LiveRun, service: string, variable: string): Source[] {
   const out: Source[] = [];
@@ -440,20 +472,24 @@ async function fetchDigests(ctx: LiveRun, sources: Source[], d: Digester): Promi
   for (const [region, names] of [...byRegion].sort((x, y) => x[0].localeCompare(y[0]))) {
     const r = ctx.ssmClient ? await ctx.ssmClient.digests(region, [...names], d.digest) : null;
     if (!r || 'failure' in r) {
-      if (r && ssmStatus && ssmStatus.complete) Object.assign(ssmStatus, { complete: false, ...ssmProblem(r, region, 'GetParameters') });
+      incomplete(ssmStatus, r ? ssmProblem(r, region, 'GetParameters') : { problem: 'SSM values could not be read because SSM could not be queried', fix: 'fix the SSM problem above and run it again' });
       for (const n of names) out.set(`ssm|${region}|${n}`, 'failed');
       continue;
     }
-    for (const n of names) out.set(`ssm|${region}|${n}`, r.digests.get(n) ?? (r.missing.has(n) ? 'missing' : 'failed'));
+    for (const n of names) {
+      const got: Fetched = r.digests.get(n) ?? (r.missing.has(n) ? 'missing' : 'failed');
+      if (got === 'failed') incomplete(ssmStatus, { problem: 'AWS SSM GetParameters returned neither a value nor InvalidParameters for a requested parameter', fix: 'run it again; if it persists, check the parameters by hand' });
+      out.set(`ssm|${region}|${n}`, got);
+    }
   }
 
   const vercelSources = [...new Map(sources.filter((s): s is Extract<Source, { kind: 'vercel' }> => s.kind === 'vercel').map((s) => [s.key, s])).values()];
   await pool(vercelSources, 4, async (src) => {
     const r = ctx.vercelClient ? await ctx.vercelClient.digest(src.project.projectId, src.project.teamId, src.v, d.digest) : null;
-    if (r !== null && !Buffer.isBuffer(r) && r !== 'unreadable') {
-      if (vercelStatus && vercelStatus.complete) Object.assign(vercelStatus, { complete: false, ...vercelProblem(r, `a variable of the project linked in ${src.project.file}`) });
+    if (r === null || (r !== 'unreadable' && 'failure' in r)) {
+      incomplete(vercelStatus, r ? vercelProblem(r, `a variable of the project linked in ${src.project.file}`) : { problem: 'Vercel values could not be read', fix: 'fix the Vercel problem above and run it again' });
       out.set(src.key, 'failed');
-    } else out.set(src.key, r ?? 'failed');
+    } else out.set(src.key, r);
   });
   return out;
 }
@@ -474,12 +510,13 @@ async function runCompare(ctx: LiveRun, relations: Relation[], candidates: Secre
     const sa = sourcesOf(ctx, p.a.service, p.a.variable);
     const sb = sourcesOf(ctx, p.b.service, p.b.variable);
     const matches: [Source, Source][] = [];
-    for (const x of sa) for (const y of sb) if (canon(x) === canon(y) || canon(x) === '*' || canon(y) === '*') matches.push([x, y]);
+    for (const x of sa) for (const y of sb) if (canon(x) === canon(y)) matches.push([x, y]);
     return { p, sa, sb, matches };
   });
   const fetched = await fetchDigests(ctx, planned.flatMap((x) => x.matches.flat()), d);
 
   const out: LiveComparison[] = [];
+  let fetchFailed = false;
   const svcOf = (name: string) => a.services.find((s) => s.name === name) ?? null;
   for (const { p, sa, sb, matches } of planned) {
     const base = { kind: p.kind, service: p.a.service, variable: p.a.variable, target: p.b };
@@ -496,10 +533,14 @@ async function runCompare(ctx: LiveRun, relations: Relation[], candidates: Secre
       const env = x.env !== '*' ? x.env : y.env;
       const fx = fetched.get(x.key) ?? 'failed';
       const fy = fetched.get(y.key) ?? 'failed';
+      if (fx === 'failed' || fy === 'failed') fetchFailed = true;
       let result: LiveComparison['result'];
       let reason: string | undefined;
-      if (fx instanceof Buffer && fy instanceof Buffer) result = Digester.same(fx, fy) ? 'equal' : 'different';
-      else if (fx === 'unreadable' || fy === 'unreadable') {
+      let newlineOnly = false;
+      if (typeof fx === 'object' && typeof fy === 'object') {
+        result = Digester.same(fx.exact, fy.exact) ? 'equal' : 'different';
+        newlineOnly = result === 'different' && Digester.same(fx.trimmed, fy.trimmed);
+      } else if (fx === 'unreadable' || fy === 'unreadable') {
         result = 'unreadable';
         reason = `${describe(fx === 'unreadable' ? x : y)} cannot be read back, so only its existence was checked`;
       } else {
@@ -521,6 +562,9 @@ async function runCompare(ctx: LiveRun, relations: Relation[], candidates: Secre
       }
       if (result !== 'different') continue;
       const both = `${describe(x)}; ${describe(y)}`;
+      // Only this fact about the values is ever told: they differ by one trailing newline and nothing else.
+      const nl = newlineOnly ? '; they differ only by a trailing newline' : '';
+      const nlFix = newlineOnly ? 'remove the trailing newline from whichever value has one (echo and heredocs add it when a secret is set), or ' : '';
       if (p.kind === 'declared') {
         sink.push(svcOf(p.a.service), p.a.service, {
           check: 'live-mismatch',
@@ -529,8 +573,8 @@ async function runCompare(ctx: LiveRun, relations: Relation[], candidates: Secre
           file: p.relation!.file,
           line: p.relation!.line,
           env,
-          problem: `declared same-as ${p.b.service}.${p.b.variable}, but the deployed values differ for ${env} (${both})`,
-          fix: `copy the ${env} value of ${p.b.service}.${p.b.variable} into ${p.a.service}.${p.a.variable}, or point both at one parameter; wirelint compared keyed digests and shows neither value`,
+          problem: `declared same-as ${p.b.service}.${p.b.variable}, but the deployed values differ for ${env} (${both})${nl}`,
+          fix: `${nlFix}copy the ${env} value of ${p.b.service}.${p.b.variable} into ${p.a.service}.${p.a.variable}, or point both at one parameter; wirelint compared keyed digests and shows neither value`,
         });
       } else {
         const label = p.a.variable === p.b.variable ? p.a.variable : `${p.a.variable} / ${p.b.variable}`;
@@ -541,8 +585,8 @@ async function runCompare(ctx: LiveRun, relations: Relation[], candidates: Secre
           file: '',
           anchor: '',
           env,
-          problem: `the deployed values differ for ${env} (${both}); if this is one shared secret, calls between them fail authentication`,
-          fix: `if they must match, set one value in both and add "# wirelint: same-as ${p.b.service}${p.a.variable === p.b.variable ? '' : `.${p.b.variable}`}" to ${p.a.variable} in the .env.example of ${p.a.service}; if they are independent, nothing to do`,
+          problem: `the deployed values differ for ${env} (${both})${nl}; if this is one shared secret, calls between them fail authentication`,
+          fix: `${nlFix}if they must match, set one value in both and add "# wirelint: same-as ${p.b.service}${p.a.variable === p.b.variable ? '' : `.${p.b.variable}`}" to ${p.a.variable} in the .env.example of ${p.a.service}; if they are independent, nothing to do`,
         });
       }
     }
@@ -550,7 +594,36 @@ async function runCompare(ctx: LiveRun, relations: Relation[], candidates: Secre
       if (results.some((r) => r === 'equal' || r === 'different')) p.relation.compared = 'value';
       else if (results.includes('unreadable')) p.relation.compared = 'unreadable';
     }
+    if (p.kind === 'inferred' && results.some((r) => r === 'equal' || r === 'different')) {
+      for (const f of a.findings) {
+        if (f.check !== 'shared-secret') continue;
+        const svcs = f.service.split(' + ');
+        const names = f.variable.split(' / ');
+        if (svcs.includes(p.a.service) && svcs.includes(p.b.service) && names.includes(p.a.variable) && names.includes(p.b.variable)) {
+          f.fix = f.fix.replace('; v0 reads files only and cannot compare live stores', '; --compare compared the deployed values, see VALUE COMPARISONS');
+        }
+      }
+    }
   }
+  // A declared relation the run could not compare anywhere is not a pass.
+  const pairKey = (c: LiveComparison) => `${c.service}.${c.variable} same-as ${c.target.service}.${c.target.variable}`;
+  const declared = out.filter((c) => c.kind === 'declared');
+  const done = new Set(declared.filter((c) => c.result !== 'not-checked').map(pairKey));
+  const why = new Map<string, Set<string>>();
+  for (const c of declared) {
+    if (done.has(pairKey(c))) continue;
+    if (!why.has(pairKey(c))) why.set(pairKey(c), new Set());
+    why.get(pairKey(c))!.add(c.reason ?? 'not compared');
+  }
+  const compared = new Set(out.filter((c) => c.result !== 'not-checked').map(pairKey)).size;
+  const list = [...why].map(([k, r]) => `${k} (${[...r].join('; ')})`);
+  ctx.adapters.push(
+    list.length
+      ? { adapter: 'compare', complete: false, requests: 0, checked: compared, problem: `${list.length === 1 ? 'a declared relation was' : 'declared relations were'} not compared in any environment: ${list.join('; ')}`, fix: 'make both sides readable by the adapters given to --live (add ssm or vercel, or the right --env), or remove the same-as annotation' }
+      : fetchFailed
+        ? { adapter: 'compare', complete: false, requests: 0, checked: compared, problem: 'some values could not be fetched, so their pairs were not compared (see the adapter problems above)', fix: 'fix the adapter problems above and run it again' }
+        : { adapter: 'compare', complete: true, requests: 0, checked: compared },
+  );
   return out;
 }
 
