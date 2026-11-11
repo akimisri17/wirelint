@@ -76,12 +76,22 @@ export function renderHuman(report: Report, opts: { width?: number; hints?: bool
     for (const e of report.edges) out.push(`  ${e.from} -> ${e.to}  via ${e.variable}${e.port ? ` (port ${e.port})` : ''}  [${e.file}]`);
   }
   if (report.relations.length) {
-    out.push('', `DECLARED RELATIONS (${report.relations.length}) - existence is checked, values are not compared`);
+    const how = report.live?.compare ? 'existence is checked; deployed values are compared below where readable' : 'existence is checked, values are not compared';
+    out.push('', `DECLARED RELATIONS (${report.relations.length}) - ${how}`);
     for (const r of report.relations) out.push(`  ${r.service}.${r.variable} same-as ${r.target.service}.${r.target.variable}  [${r.file}:${r.line}]`);
   }
   if (report.live) {
     out.push('', `LIVE CHECKS (${report.live.adapters.map((a) => a.adapter).join(', ')}) - read-only; names and verdicts only, never values`);
     for (const a of report.live.adapters) out.push(`  ${a.adapter}: ${liveLine(report, a)}`);
+    const cmp = report.live.comparisons;
+    if (report.live.compare) {
+      out.push('', `VALUE COMPARISONS (${cmp.length}) - keyed digests in memory only; no value or digest is shown`);
+      if (!cmp.length) out.push('  no same-as relation or shared-secret candidate to compare');
+      for (const c of cmp) {
+        const rel = c.kind === 'declared' ? 'same-as' : '~';
+        out.push(`  ${c.service}.${c.variable} ${rel} ${c.target.service}.${c.target.variable}  ${c.env === '-' ? '' : `${c.env}: `}${c.result}${c.kind === 'inferred' ? ' (inferred)' : ''}${c.reason ? ` - ${c.reason}` : ''}`);
+      }
+    }
   }
   if (notes.length) {
     out.push('', `NOT ANALYSED (${notes.length})`);

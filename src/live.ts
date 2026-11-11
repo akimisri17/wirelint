@@ -1,11 +1,13 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { deployTargetsOf, requirementsOf, type Analysis } from './analyze.js';
+import { deployTargetsOf, requirementsOf, type Analysis, type SecretPair } from './analyze.js';
+import { Digester } from './compare.js';
 import { isFile, readJson, readText, rel } from './fsutil.js';
 import { Http, pool, type HttpOptions, type Net } from './net.js';
 import type { AwsCredentials } from './sigv4.js';
 import { REGION_RE, Ssm, type SsmFailure } from './ssm.js';
-import type { Finding, LiveAdapterName, LiveAdapterStatus, LiveCheck, LiveSummary, Service, Severity } from './types.js';
+import { isProdName } from './names.js';
+import type { Finding, LiveAdapterName, LiveAdapterStatus, LiveCheck, LiveComparison, LiveSummary, Relation, Service, Severity } from './types.js';
 import { Vercel, vercelProblem, type VercelVar } from './vercel.js';
 import { asMap, asString, parseYaml } from './yaml.js';
 
@@ -198,6 +200,8 @@ export interface LiveRun {
   adapters: LiveAdapterStatus[];
   /** SSM references that resolved, for --compare. */
   ssmRefs: ParamRef[];
+  /** Set when SSM answered; --compare reuses it. */
+  ssmClient?: Ssm;
   /** Vercel projects that were listed, for --compare. */
   vercel: Map<Service, VercelProject>;
   vercelClient?: Vercel;
@@ -256,6 +260,7 @@ async function runSsm(ctx: LiveRun): Promise<void> {
     }
   }
   status.requests = ctx.http.requests - before;
+  if (!failed) ctx.ssmClient = ssm;
   if (failed) Object.assign(status, failed);
   else if (unknownEnvs.length) {
     status.problem = `--env ${unknownEnvs.join(', ')} matches no environment in any Copilot manifest`;
@@ -386,16 +391,180 @@ async function runVercel(ctx: LiveRun): Promise<void> {
   else status.complete = true;
 }
 
+/** Where one side of a comparison lives for one environment. In memory only. */
+type Source =
+  | { kind: 'ssm'; env: string; ref: ParamRef; key: string }
+  | { kind: 'vercel'; env: string; svc: Service; project: VercelProject; v: VercelVar; key: string };
+
+type Fetched = Buffer | 'unreadable' | 'missing' | 'failed';
+
+/** Copilot environments and Vercel targets meet on production; other names must match. */
+const canon = (src: Source): string => (src.kind === 'ssm' ? (src.env === '*' ? '*' : isProdName(src.env) ? 'production' : src.env) : src.env);
+
+function sourcesOf(ctx: LiveRun, service: string, variable: string): Source[] {
+  const out: Source[] = [];
+  for (const ref of ctx.ssmRefs) if (ref.svc.name === service && ref.variable === variable) out.push({ kind: 'ssm', env: ref.env, ref, key: `ssm|${ref.region}|${ref.name}` });
+  for (const [svc, project] of ctx.vercel) {
+    if (svc.name !== service) continue;
+    for (const v of project.vars) {
+      if (v.key !== variable || v.branchOnly) continue;
+      for (const t of v.targets) if (VERCEL_TARGETS.includes(t as (typeof VERCEL_TARGETS)[number])) out.push({ kind: 'vercel', env: t, svc, project, v, key: `vercel|${project.projectId}|${v.id}` });
+    }
+  }
+  return out;
+}
+
+function describe(src: Source): string {
+  return src.kind === 'ssm'
+    ? `${src.ref.svc.name}: the SSM parameter ${src.ref.where} in ${src.ref.file} names`
+    : `${src.svc.name}: the Vercel ${src.env} variable ${src.v.key}${src.v.type === 'sensitive' ? ' (sensitive)' : ''}`;
+}
+
+/** Fetch every needed value once, reducing each to a digest on arrival. */
+async function fetchDigests(ctx: LiveRun, sources: Source[], d: Digester): Promise<Map<string, Fetched>> {
+  const out = new Map<string, Fetched>();
+  const ssmStatus = ctx.adapters.find((x) => x.adapter === 'ssm');
+  const vercelStatus = ctx.adapters.find((x) => x.adapter === 'vercel');
+  const missing = new Set(ctx.checks.filter((c) => c.adapter === 'ssm' && c.status === 'missing').map((c) => `${c.service}|${c.variable}|${c.env}`));
+
+  const byRegion = new Map<string, Set<string>>();
+  for (const src of sources) {
+    if (src.kind !== 'ssm' || out.has(src.key)) continue;
+    if (missing.has(`${src.ref.svc.name}|${src.ref.variable}|${src.ref.env}`)) {
+      out.set(src.key, 'missing');
+      continue;
+    }
+    if (!byRegion.has(src.ref.region)) byRegion.set(src.ref.region, new Set());
+    byRegion.get(src.ref.region)!.add(src.ref.name);
+  }
+  for (const [region, names] of [...byRegion].sort((x, y) => x[0].localeCompare(y[0]))) {
+    const r = ctx.ssmClient ? await ctx.ssmClient.digests(region, [...names], d.digest) : null;
+    if (!r || 'failure' in r) {
+      if (r && ssmStatus && ssmStatus.complete) Object.assign(ssmStatus, { complete: false, ...ssmProblem(r, region, 'GetParameters') });
+      for (const n of names) out.set(`ssm|${region}|${n}`, 'failed');
+      continue;
+    }
+    for (const n of names) out.set(`ssm|${region}|${n}`, r.digests.get(n) ?? (r.missing.has(n) ? 'missing' : 'failed'));
+  }
+
+  const vercelSources = [...new Map(sources.filter((s): s is Extract<Source, { kind: 'vercel' }> => s.kind === 'vercel').map((s) => [s.key, s])).values()];
+  await pool(vercelSources, 4, async (src) => {
+    const r = ctx.vercelClient ? await ctx.vercelClient.digest(src.project.projectId, src.project.teamId, src.v, d.digest) : null;
+    if (r !== null && !Buffer.isBuffer(r) && r !== 'unreadable') {
+      if (vercelStatus && vercelStatus.complete) Object.assign(vercelStatus, { complete: false, ...vercelProblem(r, `a variable of the project linked in ${src.project.file}`) });
+      out.set(src.key, 'failed');
+    } else out.set(src.key, r ?? 'failed');
+  });
+  return out;
+}
+
+/**
+ * --compare: declared same-as relations (a difference fails) and shared-secret
+ * candidates (a difference is a suggestion), per environment both sides have.
+ */
+async function runCompare(ctx: LiveRun, relations: Relation[], candidates: SecretPair[]): Promise<LiveComparison[]> {
+  const { a, sink } = ctx;
+  const d = new Digester();
+  type Pair = { kind: 'declared' | 'inferred'; a: { service: string; variable: string }; b: { service: string; variable: string }; relation?: Relation };
+  const pairs: Pair[] = [
+    ...relations.map((r): Pair => ({ kind: 'declared', a: { service: r.service, variable: r.variable }, b: r.target, relation: r })),
+    ...candidates.map((c): Pair => ({ kind: 'inferred', ...c })),
+  ];
+  const planned = pairs.map((p) => {
+    const sa = sourcesOf(ctx, p.a.service, p.a.variable);
+    const sb = sourcesOf(ctx, p.b.service, p.b.variable);
+    const matches: [Source, Source][] = [];
+    for (const x of sa) for (const y of sb) if (canon(x) === canon(y) || canon(x) === '*' || canon(y) === '*') matches.push([x, y]);
+    return { p, sa, sb, matches };
+  });
+  const fetched = await fetchDigests(ctx, planned.flatMap((x) => x.matches.flat()), d);
+
+  const out: LiveComparison[] = [];
+  const svcOf = (name: string) => a.services.find((s) => s.name === name) ?? null;
+  for (const { p, sa, sb, matches } of planned) {
+    const base = { kind: p.kind, service: p.a.service, variable: p.a.variable, target: p.b };
+    const results: LiveComparison['result'][] = [];
+    if (matches.length === 0) {
+      const lacking = sa.length === 0 ? p.a : sb.length === 0 ? p.b : null;
+      const reason = lacking
+        ? `${lacking.service}.${lacking.variable} has no value in the live stores this run read (${ctx.opts.adapters.join(', ')})`
+        : 'the two sides share no environment';
+      out.push({ ...base, env: '-', result: 'not-checked', reason });
+      continue;
+    }
+    for (const [x, y] of matches) {
+      const env = x.env !== '*' ? x.env : y.env;
+      const fx = fetched.get(x.key) ?? 'failed';
+      const fy = fetched.get(y.key) ?? 'failed';
+      let result: LiveComparison['result'];
+      let reason: string | undefined;
+      if (fx instanceof Buffer && fy instanceof Buffer) result = Digester.same(fx, fy) ? 'equal' : 'different';
+      else if (fx === 'unreadable' || fy === 'unreadable') {
+        result = 'unreadable';
+        reason = `${describe(fx === 'unreadable' ? x : y)} cannot be read back, so only its existence was checked`;
+      } else {
+        result = 'not-checked';
+        reason = fx === 'missing' || fy === 'missing' ? 'a side does not exist (reported as live-missing)' : 'a value could not be fetched';
+      }
+      results.push(result);
+      out.push({ ...base, env, result, ...(reason ? { reason } : {}) });
+      if (result === 'unreadable') {
+        sink.push(null, p.kind === 'declared' ? p.a.service : `${p.a.service} + ${p.b.service}`, {
+          check: 'live-not-checked',
+          severity: 'info',
+          variable: p.a.variable,
+          file: p.relation?.file ?? '',
+          env,
+          problem: `values of ${p.a.service}.${p.a.variable} and ${p.b.service}.${p.b.variable} for ${env} were not compared: ${reason}`,
+          fix: 'nothing to fix; compare them by hand, or make the variable non-sensitive if that is acceptable',
+        });
+      }
+      if (result !== 'different') continue;
+      const both = `${describe(x)}; ${describe(y)}`;
+      if (p.kind === 'declared') {
+        sink.push(svcOf(p.a.service), p.a.service, {
+          check: 'live-mismatch',
+          severity: 'error',
+          variable: p.a.variable,
+          file: p.relation!.file,
+          line: p.relation!.line,
+          env,
+          problem: `declared same-as ${p.b.service}.${p.b.variable}, but the deployed values differ for ${env} (${both})`,
+          fix: `set ${p.a.service}'s value to ${p.b.service}'s for ${env}, or point both at one parameter; wirelint compared keyed digests and shows neither value`,
+        });
+      } else {
+        const label = p.a.variable === p.b.variable ? p.a.variable : `${p.a.variable} / ${p.b.variable}`;
+        sink.push(null, `${p.a.service} + ${p.b.service}`, {
+          check: 'live-mismatch',
+          severity: 'hint',
+          variable: label,
+          file: '',
+          anchor: '',
+          env,
+          problem: `the deployed values differ for ${env} (${both}); if this is one shared secret, calls between them fail authentication`,
+          fix: `if they must match, set one value in both and add "# wirelint: same-as ${p.b.service}${p.a.variable === p.b.variable ? '' : `.${p.b.variable}`}" to ${p.a.variable} in ${p.a.service}'s .env.example; if they are independent, nothing to do`,
+        });
+      }
+    }
+    if (p.relation) {
+      if (results.some((r) => r === 'equal' || r === 'different')) p.relation.compared = 'value';
+      else if (results.includes('unreadable')) p.relation.compared = 'unreadable';
+    }
+  }
+  return out;
+}
+
 export async function runLive(a: Analysis, opts: LiveOptions, net: Net): Promise<LiveResult> {
   const ctx: LiveRun = { a, opts, http: new Http(net, { ...HTTP_DEFAULTS, ...opts.http }), sink: new FindingSink(), checks: [], adapters: [], ssmRefs: [], vercel: new Map() };
   if (opts.adapters.includes('ssm')) await runSsm(ctx);
   if (opts.adapters.includes('vercel')) await runVercel(ctx);
+  const comparisons = opts.compare ? await runCompare(ctx, a.relations, a.candidates) : [];
   const live: LiveSummary = {
     adapters: ctx.adapters,
     compare: !!opts.compare,
     ...(opts.envs ? { envs: opts.envs } : {}),
     checks: ctx.checks,
-    comparisons: [],
+    comparisons,
     complete: ctx.adapters.every((s) => s.complete),
   };
   return { findings: ctx.sink.findings, suppressed: ctx.sink.suppressed, live };

@@ -30,6 +30,7 @@ Live checks: opt-in, read-only (list/describe/get calls only; nothing is written
   --live <adapters>      ssm, vercel or ssm,vercel: check that what deploy config relies on exists
                          ssm: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY [, AWS_SESSION_TOKEN] from the environment
                          vercel: VERCEL_TOKEN from the environment
+  --compare              with --live: compare same-as values as per-run keyed digests, in memory only
   --env <name>           ssm: only this Copilot environment (repeatable, or comma-separated)
   --region <region>      ssm: region (default $AWS_REGION, else $AWS_DEFAULT_REGION)
   --vercel-project <service>=<projectId>
@@ -55,7 +56,7 @@ interface Parsed {
 const PR_OPTIONS = ['--base', '--comment-file'];
 const VALUE_OPTIONS = new Set([...PR_OPTIONS, '--live', '--env', '--region', '--vercel-project', '--vercel-team']);
 const REPEATABLE = new Set(['--live', '--env', '--vercel-project']);
-const FLAGS = new Set(['--json', '--no-hints', '--no-baseline', '--pr', '-h', '--help', '-v', '--version']);
+const FLAGS = new Set(['--json', '--no-hints', '--no-baseline', '--pr', '-h', '--help', '-v', '--version', '--compare']);
 const ADAPTERS: LiveAdapterName[] = ['ssm', 'vercel'];
 
 function parse(argv: string[]): Parsed | string {
@@ -110,9 +111,10 @@ function v2Options(flags: Set<string>, values: Map<string, string[]>): V2 | stri
   if (liveRaw) {
     const bad = liveRaw.find((x) => !ADAPTERS.includes(x as LiveAdapterName));
     if (bad !== undefined) return bad ? `unknown live adapter "${bad}" (use ssm, vercel or ssm,vercel)` : '--live needs ssm, vercel or ssm,vercel';
-    out.live = { adapters: [...new Set(liveRaw)] as LiveAdapterName[] };
+    out.live = { adapters: [...new Set(liveRaw)] as LiveAdapterName[], compare: flags.has('--compare') };
   }
   const adapters = out.live?.adapters ?? [];
+  if (flags.has('--compare') && !out.live) return '--compare needs --live <adapters>; values are compared only from live stores';
   for (const k of ['--env', '--region']) if (values.has(k) && !adapters.includes('ssm')) return `${k} only applies with --live ssm`;
   for (const k of ['--vercel-project', '--vercel-team']) if (values.has(k) && !adapters.includes('vercel')) return `${k} only applies with --live vercel`;
   if (out.live) {
