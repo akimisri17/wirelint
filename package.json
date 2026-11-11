@@ -1,0 +1,31 @@
+{
+  "name": "wirecheck",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Zero-config CLI that catches cross-service environment-variable mistakes before deploy.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "wirecheck": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepare": "npm run build",
+    "pretest": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  }
+}
