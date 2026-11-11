@@ -1,0 +1,1 @@
+{ "name": "mailer", "private": true, "scripts": { "start": "node src/server.js" } }

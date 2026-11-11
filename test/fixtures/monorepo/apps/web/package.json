@@ -1,0 +1,1 @@
+{ "name": "@acme/web", "private": true, "scripts": { "dev": "vite --port 5000" } }

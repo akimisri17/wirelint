@@ -1,0 +1,1 @@
+{ "name": "billing-api", "private": true, "scripts": { "dev": "tsx watch src/server.ts" } }

@@ -1,0 +1,11 @@
+services:
+  mailer:
+    build: .
+    ports:
+      - "4003:4003"
+    environment:
+      - SMTP_HOST=smtp.example.test
+      - MAIL_FROM
+  smtp:
+    image: example/smtp-catcher:1
+    ports: ["1025:1025"]
