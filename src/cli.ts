@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { BASELINE_FILE, loadBaseline, renderGithub, renderHuman, run, version, writeBaseline } from './index.js';
+import { BASELINE_FILE, loadBaseline, renderGithub, renderHuman, renderMarkdown, run, runPr, version, writeBaseline } from './index.js';
 
 const HELP = `wirelint ${version()}
 Catch cross-service environment-variable mistakes before deploy. Reads files only:
@@ -9,29 +9,65 @@ no cloud credentials, no network, and it never prints a value from a non-example
 
 Usage
   wirelint [workspace-dir]            check a monorepo or a folder of sibling repos
+  wirelint --pr [workspace-dir]       only variables this branch adds, and where they are not set yet
   wirelint baseline [workspace-dir]   accept current findings into ${BASELINE_FILE}
 
 Options
-  --json          machine-readable report on stdout
-  --no-hints      hide suggestions in the human report
-  --no-baseline   ignore ${BASELINE_FILE}
-  -h, --help      show this help
-  -v, --version   show the version
+  --json                 machine-readable report on stdout
+  --no-hints             hide suggestions in the human report
+  --no-baseline          ignore ${BASELINE_FILE}
+  --pr                   PR mode: diff base...HEAD in each git repo among the services
+  --base <ref>           PR mode base (default origin/$GITHUB_BASE_REF, else origin/main, else main)
+  --comment-file <path>  PR mode: write a Markdown comment body to <path>
+                         (also appended to $GITHUB_STEP_SUMMARY when that is set)
+  -h, --help             show this help
+  -v, --version          show the version
 
 Exit codes: 0 no failures (suggestions never fail), 1 failures, 2 usage error.
-Suppress one variable in a service's .env.example, reason required:
+Annotate a variable in a service's .env.example:
+  JWT_SECRET=        # wirelint: same-as identity-api
+  SENTRY_DSN=        # wirelint: optional
+  NEXT_PUBLIC_URL=   # wirelint: build-time
+Suppress one variable, reason required:
   LEGACY_CATALOG_URL=https://catalog.example.test/v1/items.xml  # wirelint-ignore: third-party catalog, full path is intended
 `;
 
+interface Parsed {
+  flags: Set<string>;
+  values: Map<string, string>;
+  args: string[];
+}
+
+const VALUE_OPTIONS = new Set(['--base', '--comment-file']);
+const FLAGS = new Set(['--json', '--no-hints', '--no-baseline', '--pr', '-h', '--help', '-v', '--version']);
+
+function parse(argv: string[]): Parsed | string {
+  const out: Parsed = { flags: new Set(), values: new Map(), args: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    const eq = a.indexOf('=');
+    const name = a.startsWith('--') && eq > 0 ? a.slice(0, eq) : a;
+    if (VALUE_OPTIONS.has(name)) {
+      const value = eq > 0 && name !== a ? a.slice(eq + 1) : argv[++i];
+      if (!value || value.startsWith('-')) return `${name} needs a value`;
+      out.values.set(name, value);
+    } else if (a.startsWith('-')) {
+      if (!FLAGS.has(a)) return `unknown option ${a}`;
+      out.flags.add(a);
+    } else {
+      out.args.push(a);
+    }
+  }
+  return out;
+}
+
 function main(argv: string[]): number {
-  const flags = new Set(argv.filter((a) => a.startsWith('-')));
-  const args = argv.filter((a) => !a.startsWith('-'));
-  const known = new Set(['--json', '--no-hints', '--no-baseline', '-h', '--help', '-v', '--version']);
-  const unknown = [...flags].find((f) => !known.has(f));
-  if (unknown) {
-    process.stderr.write(`wirelint: unknown option ${unknown}\n\n${HELP}`);
+  const parsed = parse(argv);
+  if (typeof parsed === 'string') {
+    process.stderr.write(`wirelint: ${parsed}\n\n${HELP}`);
     return 2;
   }
+  const { flags, values, args } = parsed;
   if (flags.has('-h') || flags.has('--help')) {
     process.stdout.write(HELP);
     return 0;
@@ -40,8 +76,17 @@ function main(argv: string[]): number {
     process.stdout.write(version() + '\n');
     return 0;
   }
+  const prMode = flags.has('--pr');
+  if (!prMode && values.size > 0) {
+    process.stderr.write(`wirelint: ${[...values.keys()].join(' and ')} only applies with --pr\n`);
+    return 2;
+  }
   const baselineMode = args[0] === 'baseline';
   if (baselineMode) args.shift();
+  if (baselineMode && prMode) {
+    process.stderr.write('wirelint: baseline records the whole workspace; run it without --pr\n');
+    return 2;
+  }
   if (args.length > 1) {
     process.stderr.write(`wirelint: expected one workspace directory, got ${args.length}\n`);
     return 2;
@@ -58,7 +103,8 @@ function main(argv: string[]): number {
     return 0;
   }
 
-  const report = run(workspace, flags.has('--no-baseline') ? new Set() : loadBaseline(workspace));
+  const baseline = flags.has('--no-baseline') ? new Set<string>() : loadBaseline(workspace);
+  const report = prMode ? runPr(workspace, baseline, { base: values.get('--base') }) : run(workspace, baseline);
   if (report.services.length === 0) {
     process.stderr.write(`wirelint: no services found under ${workspace} (looked for child directories with a package.json or a .git)\n`);
     return 2;
@@ -70,6 +116,17 @@ function main(argv: string[]): number {
     if (process.env.GITHUB_ACTIONS) {
       const annotations = renderGithub(report, process.env.GITHUB_WORKSPACE ?? process.cwd());
       if (annotations) process.stdout.write(annotations + '\n');
+    }
+  }
+  if (prMode) {
+    const body = renderMarkdown(report);
+    const commentFile = values.get('--comment-file');
+    try {
+      if (commentFile) fs.writeFileSync(path.resolve(commentFile), body);
+      if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, body + '\n');
+    } catch (e) {
+      process.stderr.write(`wirelint: could not write the PR comment: ${(e as Error).message}\n`);
+      return 2;
     }
   }
   return report.summary.failures > 0 ? 1 : 0;

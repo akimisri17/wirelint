@@ -208,6 +208,8 @@ export interface Report {
   /** Resolved same-as relations. */
   relations: Relation[];
   findings: Finding[];
+  /** Present only in PR mode (`--pr`). */
+  pr?: PrSummary;
   summary: {
     failures: number;
     suggestions: number;
@@ -216,4 +218,38 @@ export interface Report {
     suppressed: number;
     durationMs: number;
   };
+}
+
+/** One git repository among the discovered services, as PR mode saw it. */
+export interface PrRepo {
+  /** Repository root, relative to the workspace ('.' when it is the workspace). */
+  root: string;
+  services: string[];
+  /** The ref diffed against (`base...HEAD`), when one resolved. */
+  base?: string;
+  /** Why the repository was skipped, when it was. */
+  skipped?: string;
+}
+
+/** A variable the diff adds, and where it is not yet set. */
+export interface PrVariable {
+  service: string;
+  variable: string;
+  /** Added lines that read or declare it. */
+  added: { file: string; line: number }[];
+  /** Annotations on it, if any. */
+  annotations: AnnotationKind[];
+  /**
+   * Deploy targets (or, for build-time variables, build configurations) that
+   * do not set it yet, with the environments concerned. `envs` is empty when
+   * the target has no per-environment config.
+   */
+  missing: { target: string; kind: string; envs: string[] }[];
+  /** No deploy target (or build configuration) for the service is visible in the checkout. */
+  noTargets: boolean;
+}
+
+export interface PrSummary {
+  repos: PrRepo[];
+  variables: PrVariable[];
 }
