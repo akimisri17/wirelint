@@ -127,12 +127,13 @@ values (`${HOST}`, `<your-url>`, `your-domain`), and platform variables
 
 Optional. An annotation sits in the service's own `.env.example`, next to the
 variable it describes, either at the end of the line or on the line directly
-above it. Several are separated by commas. There is no central contract file.
+above it. Several are separated by commas. Anything after ` -- ` is a note
+for humans and is ignored. There is no central contract file.
 
 ```bash
 JWT_SECRET=           # wirelint: same-as identity-api
 INTERNAL_SERVICE_KEY= # wirelint: same-as billing-api.ORDERS_SERVICE_KEY
-SENTRY_DSN=           # wirelint: optional
+SENTRY_DSN=           # wirelint: optional -- only reported in prod
 
 # wirelint: build-time
 NEXT_PUBLIC_API_URL=http://localhost:4000
@@ -142,14 +143,19 @@ NEXT_PUBLIC_API_URL=http://localhost:4000
 | --- | --- |
 | `same-as <service>` | this variable must hold the same value as the same-named one in `<service>`. It replaces the `shared-secret` guess with a declared relation (listed under `DECLARED RELATIONS` and in `--json` as `relations`), and fails when `<service>` does not exist, stops declaring the variable, or sets it for a deploy environment this service does not. `same-as <service>.<NAME>` covers a differently named variable. Values are not compared. |
 | `optional` | the variable may be absent from every deploy target; no `missing-from-deploy` finding |
-| `build-time` | checked against build configuration (Dockerfile `ARG`/`ENV`, compose `build.args`, `vercel.json` `build.env`) instead of runtime manifests. Fails only when a build configuration is visible and none sets it; otherwise a suggestion |
+| `build-time` | checked against build configuration (Dockerfile `ARG`/`ENV`, compose `build.args`, `vercel.json` `build.env`) instead of runtime manifests. Fails only when the service has a container deploy target (a Copilot manifest or a production compose file) and none of its visible build configurations sets it; otherwise a suggestion |
 
 A typo is a failure, not a silent no-op:
 
 ```
 web  FEATURE_FLAGS  web/.env.example:3  unknown wirelint annotation "optinal", so it is not honoured
-                                        fix: write "optional" instead of "optinal"
+                                        fix: write "optional" instead of "optinal"; put any explanation after " -- ",
+                                             e.g. "# wirelint: optional -- only used in prod"
 ```
+
+An explanation on its own comment line between the annotation and the
+variable detaches the annotation, which is also a failure; put it after ` -- `
+on the annotation's line instead.
 
 ## Fallback chains
 
@@ -185,8 +191,10 @@ answer. For every git repository among the services (each sibling repo, or
 the monorepo once), wirelint diffs `base...HEAD` and keeps only the variables
 the diff adds: new env reads on added source lines and new names in
 `.env.example`. An edited or moved line does not count. For each one it says
-which deploy targets and environments do not set it yet, then prints the
-usual findings filtered to those variables.
+which deploy targets and environments do not set it yet (nothing for an
+`optional` variable, and an environment that sets another member of the same
+fallback chain counts as set), then prints the usual findings filtered to
+those variables.
 
 ```
 NEW IN THIS DIFF (1)
@@ -196,8 +204,18 @@ NEW IN THIS DIFF (1)
 
 The base is `--base`, else `origin/$GITHUB_BASE_REF` when that is set, else
 `origin/main`, else `main`. Nothing is fetched: the ref must already be in the
-checkout. A repository with no resolvable base is skipped with a note. Exit
-codes are the same as a full run.
+checkout. A repository that cannot be diffed (no resolvable base, no merge
+base in a shallow clone, git missing, not a git checkout, or a git error such
+as dubious ownership) is skipped, and the output and the comment headline say
+the run was **not fully checked**, with the reason and the fix. Exit codes are
+the same as a full run, except that when every repository was skipped nothing
+was checked and the exit code is `2`.
+
+If `--comment-file` cannot be written, that is reported on stderr and the
+exit code is `2` unless findings already made it `1`. A `$GITHUB_STEP_SUMMARY`
+that cannot be written is only a warning. In the comment body, names, paths
+and anything else read from the repository are put in code spans or escaped,
+so they cannot render as HTML or mention anyone.
 
 With `--comment-file` it also writes a Markdown comment body, and appends the
 same body to `$GITHUB_STEP_SUMMARY` when that is set. wirelint never posts
