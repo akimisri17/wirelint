@@ -255,7 +255,7 @@ used for the request and not stored.
 wirelint --live ssm [--env prod] [--region eu-west-1] .      # SSM parameters the Copilot manifests reference exist
 wirelint --live vercel [--vercel-project web=prj_123] .      # required variables are set in the Vercel project
 wirelint --live ssm,vercel --compare .                       # same-as values are equal, compared as keyed digests
-wirelint --probe [--probe-path /health] [--probe-strict] .   # each inferred link answers in production
+wirelint --probe [--probe-path /health] [--probe-strict] [--probe-allow-private] .  # each inferred link answers in production
 ```
 
 The adapters were built against the documented AWS SSM and Vercel REST APIs
@@ -273,7 +273,17 @@ never values. Credentials: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and,
 for temporary credentials, `AWS_SESSION_TOKEN`; region from `--region`, else
 `AWS_REGION`, else `AWS_DEFAULT_REGION` (an ARN's own region wins for that
 parameter). Secrets Manager references (`secretsmanager:` or an ARN) and
-anything it cannot resolve are listed as not checked, never failed.
+anything it cannot resolve are listed as not checked, never failed. So is an
+SSM ARN that names an account: wirelint does not ask which account the
+credentials belong to, so "not found" there would prove nothing (an ARN with an
+empty account field is checked).
+
+Copilot environments often live in different accounts or regions. When a
+manifest has several environments and the run has no `--env`, a parameter the
+credentials do not find is a suggestion whose fix is to re-run with
+`--env <name>` and that environment's credentials and region. With `--env`, or
+when the manifest has exactly one environment, it fails. A manifest with no
+`environments:` block is treated as production only.
 
 The minimum IAM policy for existence checks:
 
@@ -297,8 +307,15 @@ and the key that encrypts them:
 **`--live vercel`** applies to services with a `vercel.json`, a
 `.vercel/project.json` (written by `vercel link`) or a `--vercel-project
 <service>=<projectId>`. It lists the project's variables with
-`GET /v9/projects/{id}/env`: keys, targets and types, not decrypted; any value
-in the answer is dropped when it is parsed. A required variable (graded
+`GET /v10/projects/{id}/env`: keys, targets and types, not decrypted; any value
+in the answer is dropped when it is parsed. The documented answer is either
+`{ envs, pagination: { count, next, prev } }`, where `next` is a timestamp for
+the next page or null, or `{ envs, hiddenProductionEnvCount }`. The docs name
+no query parameter for that timestamp; wirelint sends it as `until`. Listing
+stops when `next` is absent or null. A page that adds no new variable while
+`next` is still set, more than 50 pages, or a non-zero
+`hiddenProductionEnvCount` makes the check incomplete (exit `2`), never a
+pass. A required variable (graded
 exactly like `missing-from-deploy`, plus `build-time` variables, because one
 Vercel store serves both) that is not set for `production` fails; gaps in
 `preview` and `development` are suggestions. Token: `VERCEL_TOKEN`. Team:
@@ -306,7 +323,8 @@ Vercel store serves both) that is not set for `production` fails; gaps in
 `VERCEL_TEAM_ID`. Create the token under Account Settings > Tokens, scoped to
 the team that owns the projects. Vercel tokens cannot be made read-only, so
 keep it in your CI secrets even though wirelint only sends GET requests. A
-Vercel service with no linked project is a note with the fix, not a failure.
+Vercel service with no linked project is a note with the fix, not a failure;
+but if no Vercel service could be checked at all, the check is incomplete.
 
 **`--compare`** (needs `--live`) compares both sides of every `same-as`
 relation, and of every `shared-secret` suggestion, in each environment both
@@ -318,7 +336,13 @@ printed or written, and because the key dies with the run, nothing comparable
 outlives it. A difference fails for a declared `same-as` and is a suggestion
 for an inferred pair. Vercel `sensitive` variables cannot be read back by
 design, so for them only existence is reported. In `--json`, a relation's
-`compared` becomes `value` or `unreadable`.
+`compared` becomes `value` or `unreadable`. A declared `same-as` that could not
+be compared in any environment (one side is in no store the run read, or the
+sides share no environment) makes the run incomplete and names the relation
+and why, and so does any value that could not be fetched. When two values
+differ, wirelint also compares digests with one trailing `\n` or `\r\n`
+removed; if those match, the finding says the values differ only by a trailing
+newline. Nothing else about the values is ever told.
 
 **`--probe`** (works with or without `--live`) takes, for each inferred link,
 the base URL the calling service uses in production (a deploy target's
@@ -332,17 +356,40 @@ URL or host. A probe from a laptop that cannot reach a service proves nothing
 `--probe-strict` makes DNS failure, connection refused and 5xx answers fail,
 for a runner that sits inside the network.
 
+Because the URL comes from repo config, a probe could otherwise aim a CI
+runner at its own metadata service or internal network. Before sending, wirelint
+resolves the host (every A and AAAA answer) and refuses the probe if any answer,
+or an IP literal in the URL, is not a public address: loopback, private (RFC
+1918, unique local), link-local (including `169.254.169.254` and
+`fd00:ec2::254`), CGNAT, `0.0.0.0` and other reserved ranges, and IPv6 forms
+that embed such an IPv4 address (mapped, compatible, NAT64, 6to4). Decimal,
+hex and octal hosts such as `http://2130706433/` are checked as the URL parser
+normalises them. A refused link is `probe-not-checked` with the reason
+"private address"; the address is never printed. `--probe-allow-private`
+turns the guard off, for a runner inside the network that should reach
+private services. `--probe-path` must be a plain path: it starts with `/`, has
+no scheme, host, query, fragment or `.`/`..` segment.
+
+Known limit: the check resolves the name, then `fetch` resolves it again to
+connect. A DNS server that answers differently the second time (DNS
+rebinding) can still steer one probe to a private address. The probe sends
+only a GET with no credentials and reads only the status code, but if that
+matters, run probes from a runner with no access to anything private.
+
 **When a check cannot run**, wirelint says so at the top of the report
 (`LIVE CHECK INCOMPLETE`), on stderr and as a GitHub warning, and exits `2`:
-missing or rejected credentials, access denied, an unreachable endpoint, or
-throttling that did not stop after bounded retries. Failures still exit `1`.
-Upstream error messages are never quoted, only an error code such as
-`AccessDeniedException`, because they can contain account ids and ARNs.
+missing or rejected credentials, access denied, an unreachable endpoint,
+throttling that did not stop after bounded retries, an answer in a shape the
+docs do not describe (`MalformedResponse`), or nothing to check at all (an
+adapter that found no reference or project it could check). Failures still
+exit `1`. Upstream error messages are never quoted, only an error code such
+as `AccessDeniedException`, because they can contain account ids and ARNs. An
+unexpected internal error prints a fixed message, never its text or stack.
 
 Example failures and fixes:
 
 ```
-orders  JWT_SECRET  orders/copilot/orders/manifest.yml  (live-missing, env dev)
+orders  JWT_SECRET  orders/copilot/orders/manifest.yml  (live-missing, env dev, with --env dev)
         secrets.JWT_SECRET references an SSM parameter that does not exist in eu-west-1 for
         environment dev; tasks that need it fail to start
         fix: create the parameter that secrets.JWT_SECRET in orders/copilot/orders/manifest.yml
