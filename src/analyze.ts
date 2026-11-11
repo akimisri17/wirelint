@@ -16,6 +16,14 @@ export interface Analysis {
   relations: Relation[];
   findings: Finding[];
   suppressed: number;
+  /** Shared-secret suggestions as pairs, for an opt-in value comparison. In memory only. */
+  candidates: SecretPair[];
+}
+
+/** Two variables a shared-secret suggestion says probably hold one value. */
+export interface SecretPair {
+  a: { service: string; variable: string };
+  b: { service: string; variable: string };
 }
 
 const KIND_NOTE: Record<ReadKind, string> = {
@@ -149,6 +157,54 @@ export function annotationsOf(svc: Service): Map<string, Set<AnnotationKind>> {
  */
 export function deployTargetsOf(svc: Service): DeployTarget[] {
   return [...manifestsFor(svc).use, ...svc.targets.filter((t) => t.kind === 'compose' && t.envs.some((e) => isProdName(e.name)))];
+}
+
+/** A variable, or a fallback chain, that a deploy environment must set. */
+export interface Requirement {
+  /** One name, or the members of a fallback chain (any one satisfies it). */
+  names: string[];
+  kind: ReadKind;
+  file: string;
+  line: number;
+  /** Graded like missing-from-deploy: true when its absence is a failure, false for a suggestion. */
+  hard: boolean;
+}
+
+/**
+ * What a deploy environment must set for this service, graded exactly like
+ * missing-from-deploy: reads with a real default, optional annotations,
+ * platform variables, Dockerfile ENV and suppressed names are left out.
+ * `buildTime` keeps build-time variables, for platforms whose one variable
+ * store serves both the build and the runtime (Vercel).
+ */
+export function requirementsOf(svc: Service, opts: { buildTime: boolean }): Requirement[] {
+  const uses = usesOf(svc);
+  const ann = annotationsOf(svc);
+  const has = (name: string, kind: AnnotationKind) => ann.get(name)?.has(kind) ?? false;
+  const exempt = (name: string) => has(name, 'optional') || (!opts.buildTime && has(name, 'build-time')) || svc.suppress.has(name) || svc.baked.has(name);
+  const inExample = new Set(svc.envFiles.filter((f) => f.isExample).flatMap((f) => [...f.vars.keys()]));
+  const individually = (name: string) => {
+    const u = uses.get(name);
+    return !!u && u.kind !== 'default' && u.kind !== 'flag' && !exempt(name);
+  };
+  const out: Requirement[] = [];
+  for (const u of [...uses.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+    if (u.kind === 'default' || u.kind === 'flag' || exempt(u.name)) continue;
+    out.push({ names: [u.name], kind: u.kind, file: u.first.file, line: u.first.line, hard: u.kind !== 'plain' || inExample.has(u.name) });
+  }
+  for (const c of chainsOf(svc)) {
+    if (c.kind === 'default' || c.kind === 'flag') continue;
+    if (c.names.some((n) => isPlatformVar(n) || individually(n) || exempt(n))) continue;
+    out.push({ names: c.names, kind: c.kind, file: c.file, line: c.line, hard: c.kind !== 'plain' || c.names.some((n) => inExample.has(n)) });
+  }
+  // Build-time names are annotated, not necessarily read in code.
+  if (opts.buildTime) {
+    for (const a of svc.annotations) {
+      if (a.kind !== 'build-time' || exempt(a.variable) || isPlatformVar(a.variable) || out.some((r) => r.names.includes(a.variable))) continue;
+      out.push({ names: [a.variable], kind: 'required', file: a.file, line: a.line, hard: true });
+    }
+  }
+  return out;
 }
 
 /**
@@ -556,14 +612,14 @@ export function analyze(workspaceArg: string): Analysis {
   }
 
   const edges = inferEdges(services);
-  sharedSecretHints(services, edges, relations, push);
+  const candidates = sharedSecretHints(services, edges, relations, push);
 
   const rank: Record<Severity, number> = { error: 0, hint: 1, info: 2 };
   findings.sort(
     (a, b) => rank[a.severity] - rank[b.severity] || a.service.localeCompare(b.service) || a.check.localeCompare(b.check) || a.variable.localeCompare(b.variable),
   );
   const annotations = services.flatMap((s) => s.annotations);
-  return { workspace, services, edges, annotations, relations, findings, suppressed };
+  return { workspace, services, edges, annotations, relations, findings, suppressed, candidates };
 }
 
 function fixForBuild(b: BuildConfig, name: string): string {
@@ -610,7 +666,8 @@ function inferEdges(services: Service[]): Edge[] {
 type Push = (svc: Service | null, f: { check: string; severity: Severity; service?: string; variable: string; file: string; line?: number; env?: string; anchor?: string; problem: string; fix: string }) => void;
 
 /** Suggestions only: secrets that two services probably need to agree on. */
-function sharedSecretHints(services: Service[], edges: Edge[], relations: Relation[], push: Push): void {
+function sharedSecretHints(services: Service[], edges: Edge[], relations: Relation[], push: Push): SecretPair[] {
+  const pairs: SecretPair[] = [];
   const related = (a: Service, an: string, b: Service, bn: string) =>
     relations.some(
       (r) =>
@@ -640,6 +697,7 @@ function sharedSecretHints(services: Service[], edges: Edge[], relations: Relati
       for (const s of list) if (!reached.has(s) && [...reached].some((r) => related(r, name, s, name))) grew = reached.add(s).size > 0;
     }
     if (reached.size === list.length) continue;
+    for (const s of list.slice(1)) if (!related(list[0]!, name, s, name)) pairs.push({ a: { service: list[0]!.name, variable: name }, b: { service: s.name, variable: name } });
     const notes: string[] = [];
     if (list.some((a) => list.some((b) => a !== b && connected(a, b)))) notes.push('at least two of them call each other');
     const exampleValues = list
@@ -680,6 +738,7 @@ function sharedSecretHints(services: Service[], edges: Edge[], relations: Relati
     const first = group[0]!;
     const other = group.find((g) => g.svc !== first.svc && g.name !== first.name && !related(first.svc, first.name, g.svc, g.name));
     if (!other) continue;
+    pairs.push({ a: { service: first.svc.name, variable: first.name }, b: { service: other.svc.name, variable: other.name } });
     push(null, {
       check: 'shared-secret',
       severity: 'hint',
@@ -692,4 +751,5 @@ function sharedSecretHints(services: Service[], edges: Edge[], relations: Relati
       fix: 'confirm both resolve to the same value in each environment, and consider giving them one name',
     });
   }
+  return pairs;
 }

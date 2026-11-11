@@ -1,13 +1,17 @@
 import fs from 'node:fs';
 import { analyze, type Analysis } from './analyze.js';
+import { runLive, type LiveOptions } from './live.js';
 import { isPlatformVar } from './names.js';
+import { defaultNet, type Net } from './net.js';
 import { scanPr, type PrOptions } from './pr.js';
-import type { Finding, Report } from './types.js';
+import type { Finding, Report, Severity } from './types.js';
 
 export { analyze } from './analyze.js';
 export { loadBaseline, writeBaseline, BASELINE_FILE } from './baseline.js';
 export { renderGithub, renderHuman, renderMarkdown } from './render.js';
 export type { PrOptions } from './pr.js';
+export type { LiveOptions } from './live.js';
+export type { Net } from './net.js';
 export type * from './types.js';
 
 export function version(): string {
@@ -64,5 +68,45 @@ export function runPr(workspace: string, baseline: Set<string> = new Set(), opts
   const pr = scanPr(a, opts);
   const report = toReport(a, a.findings.filter(pr.keep), baseline, started);
   report.pr = pr.summary;
+  return report;
+}
+
+/** Options for `check`. Each v2 part runs only when its options are present. */
+export interface CheckOptions {
+  /** PR mode, as `runPr`. */
+  pr?: PrOptions;
+  /** Live adapters (`--live`), read-only. */
+  live?: LiveOptions;
+}
+
+const RANK: Record<Severity, number> = { error: 0, hint: 1, info: 2 };
+
+/**
+ * The full run: the file analysis, PR mode when asked, then the opt-in live
+ * checks. All network traffic goes through `net`; without `live` (or a probe)
+ * it is never called. Findings from live checks go through the PR filter too,
+ * so PR mode reports only what concerns the variables the diff adds.
+ */
+export async function check(workspace: string, baseline: Set<string> = new Set(), opts: CheckOptions = {}, net: Net = defaultNet()): Promise<Report> {
+  const started = performance.now();
+  const a = analyze(workspace);
+  const pr = opts.pr ? scanPr(a, opts.pr) : null;
+  const extra: Finding[] = [];
+  let suppressed = 0;
+  let live: Report['live'];
+  if (opts.live) {
+    const r = await runLive(a, opts.live, net);
+    extra.push(...r.findings);
+    suppressed += r.suppressed;
+    live = r.live;
+  }
+  const all = [...a.findings, ...extra].sort(
+    (x, y) => RANK[x.severity] - RANK[y.severity] || x.service.localeCompare(y.service) || x.check.localeCompare(y.check) || x.variable.localeCompare(y.variable),
+  );
+  const report = toReport(a, pr ? all.filter(pr.keep) : all, baseline, started);
+  report.summary.suppressed += suppressed;
+  if (pr) report.pr = pr.summary;
+  if (live) report.live = live;
+  report.summary.durationMs = Math.round(performance.now() - started);
   return report;
 }

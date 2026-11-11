@@ -109,9 +109,10 @@ export interface Annotation {
 
 /**
  * A declared same-value relation: `variable` in `service` must hold the same
- * value as `target.variable` in `target.service`. v1 checks only that both
- * sides still declare it; `compared` says so, so a later version that compares
- * values can tell what has already been checked.
+ * value as `target.variable` in `target.service`. Without `--compare` only
+ * existence is checked. With it, `compared` is `value` when the deployed
+ * values were compared (as keyed digests) in at least one environment, and
+ * `unreadable` when a side cannot be read back (a Vercel sensitive variable).
  */
 export interface Relation {
   kind: 'same-as';
@@ -120,7 +121,7 @@ export interface Relation {
   file: string;
   line: number;
   target: { service: string; variable: string };
-  compared: 'existence';
+  compared: 'existence' | 'value' | 'unreadable';
 }
 
 /** Variables read through a fallback chain such as `A ?? B ?? 'http://localhost'`. */
@@ -210,6 +211,10 @@ export interface Report {
   findings: Finding[];
   /** Present only in PR mode (`--pr`). */
   pr?: PrSummary;
+  /** Present only with `--live`. Names, existence and verdicts; never a value or a digest. */
+  live?: LiveSummary;
+  /** Present only with `--probe`. Variable names and status classes; never a URL or host. */
+  probe?: ProbeSummary;
   summary: {
     failures: number;
     suggestions: number;
@@ -259,4 +264,80 @@ export interface PrSummary {
   complete: boolean;
   /** Repositories actually diffed. Zero means nothing was checked. */
   checked: number;
+}
+
+export type LiveAdapterName = 'ssm' | 'vercel';
+
+/** How one requested live adapter fared. `complete: false` makes the run exit 2 unless findings exit 1. */
+export interface LiveAdapterStatus {
+  adapter: LiveAdapterName;
+  /** Every check this adapter planned ran to an answer. */
+  complete: boolean;
+  /** HTTP requests made, retries included. */
+  requests: number;
+  /** Variables (or parameters) whose existence was answered. */
+  checked: number;
+  /** Why it did not run, or did not finish. No upstream message is ever quoted. */
+  problem?: string;
+  fix?: string;
+}
+
+/** One existence check against a live store. */
+export interface LiveCheck {
+  adapter: LiveAdapterName;
+  service: string;
+  variable: string;
+  /** The file that references it: a Copilot manifest, or the service's Vercel project link. */
+  file: string;
+  /** Copilot environment, or Vercel target (production, preview, development). */
+  env: string;
+  status: 'present' | 'missing' | 'not-checked';
+  /** Why it was not checked, when it was not. */
+  reason?: string;
+}
+
+/** One value comparison: equal or different, decided on keyed digests held only in memory. */
+export interface LiveComparison {
+  /** `declared` for a same-as annotation, `inferred` for a shared-secret candidate. */
+  kind: 'declared' | 'inferred';
+  service: string;
+  variable: string;
+  target: { service: string; variable: string };
+  env: string;
+  result: 'equal' | 'different' | 'unreadable' | 'not-checked';
+  reason?: string;
+}
+
+export interface LiveSummary {
+  adapters: LiveAdapterStatus[];
+  /** `--compare` was given. */
+  compare: boolean;
+  /** Environments the run was restricted to with `--env`, if any. */
+  envs?: string[];
+  checks: LiveCheck[];
+  comparisons: LiveComparison[];
+  /** False when any requested adapter could not authenticate, reach or finish. */
+  complete: boolean;
+}
+
+/** What one inferred link answered. The address is never recorded, only the variable that holds it. */
+export interface ProbeResult {
+  from: string;
+  to: string;
+  variable: string;
+  /** Production config the base URL was taken from. */
+  file?: string;
+  env?: string;
+  outcome: 'answered' | 'timeout' | 'dns' | 'refused' | 'tls' | 'unreachable' | 'skipped';
+  /** HTTP status, when it answered. */
+  status?: number;
+  /** Why it was skipped. */
+  reason?: string;
+}
+
+export interface ProbeSummary {
+  path: string;
+  timeoutMs: number;
+  strict: boolean;
+  results: ProbeResult[];
 }

@@ -1,5 +1,5 @@
 import path from 'node:path';
-import type { Finding, PrRepo, PrVariable, Report } from './types.js';
+import type { Finding, LiveAdapterStatus, PrRepo, PrVariable, Report } from './types.js';
 
 function wrap(text: string, width: number): string[] {
   const lines: string[] = [];
@@ -52,6 +52,11 @@ export function renderHuman(report: Report, opts: { width?: number; hints?: bool
   const errors = report.findings.filter((f) => f.severity === 'error');
   const hints = report.findings.filter((f) => f.severity === 'hint');
   const notes = report.findings.filter((f) => f.severity === 'info');
+  const incomplete = (report.live?.adapters ?? []).filter((a) => !a.complete);
+  if (incomplete.length) {
+    out.push('', `LIVE CHECK INCOMPLETE: ${incomplete.map((a) => a.adapter).join(', ')} did not run in full, so a pass here proves nothing about ${incomplete.length === 1 ? 'it' : 'them'}`);
+    for (const a of incomplete) out.push(`  ${a.adapter}: ${a.problem}`, `    fix: ${a.fix}`);
+  }
   if (report.pr) {
     const { repos, variables } = report.pr;
     for (const r of repos) if (!r.skipped) out.push(`  diffed repo ${r.root} against ${r.base}`);
@@ -74,6 +79,10 @@ export function renderHuman(report: Report, opts: { width?: number; hints?: bool
     out.push('', `DECLARED RELATIONS (${report.relations.length}) - existence is checked, values are not compared`);
     for (const r of report.relations) out.push(`  ${r.service}.${r.variable} same-as ${r.target.service}.${r.target.variable}  [${r.file}:${r.line}]`);
   }
+  if (report.live) {
+    out.push('', `LIVE CHECKS (${report.live.adapters.map((a) => a.adapter).join(', ')}) - read-only; names and verdicts only, never values`);
+    for (const a of report.live.adapters) out.push(`  ${a.adapter}: ${liveLine(report, a)}`);
+  }
   if (notes.length) {
     out.push('', `NOT ANALYSED (${notes.length})`);
     for (const n of notes) out.push(`  ${n.service}: ${n.problem}`);
@@ -83,9 +92,18 @@ export function renderHuman(report: Report, opts: { width?: number; hints?: bool
     '',
     `${s.failures} failure${s.failures === 1 ? '' : 's'}, ${s.suggestions} suggestion${s.suggestions === 1 ? '' : 's'}` +
       (extras.length ? ` (${extras.join(', ')})` : '') +
-      (s.failures ? '. Fix them, or run "wirelint baseline" to accept the current state.' : '.'),
+      (s.failures ? '. Fix them, or run "wirelint baseline" to accept the current state.' : '.') +
+      (incomplete.length ? ` Live check incomplete: ${incomplete.map((a) => a.adapter).join(', ')}.` : ''),
   );
   return out.join('\n');
+}
+
+function liveLine(report: Report, a: LiveAdapterStatus): string {
+  const checks = report.live!.checks.filter((c) => c.adapter === a.adapter);
+  const n = (status: string) => checks.filter((c) => c.status === status).length;
+  const unit = a.adapter === 'ssm' ? 'parameter references' : 'variables';
+  const counts = `${n('present')} present, ${n('missing')} missing, ${n('not-checked')} not checked`;
+  return `${checks.length ? counts : `no ${unit} to check`} (${a.requests} request${a.requests === 1 ? '' : 's'})${a.complete ? '' : '; INCOMPLETE'}`;
 }
 
 function where(v: PrVariable): string {
@@ -153,6 +171,9 @@ export function renderMarkdown(report: Report): string {
     : skipped.length ? `not fully checked; ${plural} in the part that was checked`
     : `${plural} in this change`;
   out.push(`### wirelint: ${headline}`, '');
+  for (const a of (report.live?.adapters ?? []).filter((x) => !x.complete)) {
+    out.push(`> **Live check ${mdCode(a.adapter)} incomplete:** ${mdText(a.problem ?? '')}. **Fix:** ${mdText(a.fix ?? '')}`, '');
+  }
   if (skipped.length) {
     for (const r of skipped) out.push(`> **Not checked:** ${skipLabel(r, mdCode)}: ${mdText(r.skipped!)}. **Fix:** ${mdText(r.fix ?? '')}`, '>');
     out.pop();
@@ -176,7 +197,8 @@ export function renderMarkdown(report: Report): string {
   };
   section('Failures', report.findings.filter((f) => f.severity === 'error'));
   section('Suggestions, never fail the run', report.findings.filter((f) => f.severity === 'hint'));
-  out.push(`${s.failures} failure${s.failures === 1 ? '' : 's'}, ${s.suggestions} suggestion${s.suggestions === 1 ? '' : 's'}. wirelint ${report.version}, files only, no values from deployed config.`);
+  const scope = report.live || report.probe ? 'files plus read-only live checks; no values, digests or addresses are shown' : 'files only, no values from deployed config';
+  out.push(`${s.failures} failure${s.failures === 1 ? '' : 's'}, ${s.suggestions} suggestion${s.suggestions === 1 ? '' : 's'}. wirelint ${report.version}, ${scope}.`);
   return out.join('\n') + '\n';
 }
 
@@ -196,6 +218,9 @@ export function renderGithub(report: Report, repoRoot: string): string {
     }
     props.push(`title=${escProp(`wirelint ${f.check}: ${f.variable}`)}`);
     lines.push(`::${level} ${props.join(',')}::${escData(`[${f.service}] ${f.variable} ${f.problem}. Fix: ${f.fix}`)}`);
+  }
+  for (const a of (report.live?.adapters ?? []).filter((x) => !x.complete)) {
+    lines.push(`::warning title=${escProp(`wirelint live check ${a.adapter} incomplete`)}::${escData(`${a.problem}. Fix: ${a.fix}`)}`);
   }
   return lines.join('\n');
 }
