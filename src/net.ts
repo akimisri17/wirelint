@@ -12,9 +12,20 @@ export interface Net {
   fetch: typeof globalThis.fetch;
   /** Backoff between retries. Tests pass a no-op so nothing waits. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Every A and AAAA answer for a host. Probes resolve first and refuse
+   * non-public addresses. Required for --probe: a Net without it cannot probe.
+   */
+  lookup?: (host: string) => Promise<string[]>;
 }
 
-export const defaultNet = (): Net => ({ fetch: (...args) => globalThis.fetch(...args) });
+export const defaultNet = (): Net => ({
+  fetch: (...args) => globalThis.fetch(...args),
+  lookup: async (host) => {
+    const { lookup } = await import('node:dns/promises');
+    return (await lookup(host, { all: true, verbatim: true })).map((r) => r.address);
+  },
+});
 
 export interface HttpOptions {
   /** Per-request timeout, including reading the body. */

@@ -1,10 +1,11 @@
 import path from 'node:path';
+import { ipLiteral, isNonPublic } from './addr.js';
 import { deployTargetsOf, type Analysis } from './analyze.js';
 import { parseEnv } from './dotenv.js';
 import { readJson, readText } from './fsutil.js';
 import { FindingSink } from './live.js';
 import { isProdName } from './names.js';
-import { Http, pool, type Net } from './net.js';
+import { classifyError, Http, pool, type Net } from './net.js';
 import type { Edge, Finding, ProbeResult, ProbeSummary, Service } from './types.js';
 import { isPlaceholder } from './url.js';
 import { asList, asMap, asString, parseYaml } from './yaml.js';
@@ -22,6 +23,14 @@ export interface ProbeOptions {
   timeoutMs: number;
   /** DNS failure, connection refused and 5xx fail the run. */
   strict: boolean;
+  /** Probe loopback, private, link-local and other non-public addresses too. */
+  allowPrivate?: boolean;
+}
+
+/** A probe path: starts with one "/", no scheme or host, no query or fragment, no dot segments. */
+export function validProbePath(p: string): boolean {
+  if (!/^\/[A-Za-z0-9\-._~!$&'()*+,;=:@/]*$/.test(p) || p.startsWith('//')) return false;
+  return !p.split('/').some((seg) => seg === '.' || seg === '..');
 }
 
 /** A production value, in memory only. */
@@ -84,12 +93,11 @@ export function probeUrl(raw: string, probePath: string): URL | { reason: string
     return { reason: 'its production value is not an absolute URL' };
   }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') return { reason: 'its production value is not http or https' };
-  const [p, q] = probePath.split(/\?(.*)/s);
   u.username = '';
   u.password = '';
   u.hash = '';
-  u.search = q ? `?${q}` : '';
-  u.pathname = u.pathname.replace(/\/+$/, '') + p;
+  u.search = '';
+  u.pathname = u.pathname.replace(/\/+$/, '') + probePath;
   return u;
 }
 
@@ -114,6 +122,31 @@ export async function runProbe(a: Analysis, opts: ProbeOptions, net: Net): Promi
     if ('reason' in prod) return { ...base, outcome: 'skipped', reason: prod.reason };
     const url = probeUrl(prod.value, opts.path);
     if (!(url instanceof URL)) return { ...base, file: prod.file, env: prod.env, outcome: 'skipped', reason: url.reason };
+    if (!opts.allowPrivate) {
+      // Resolve first and refuse non-public answers, so repo config cannot aim a CI runner at
+      // loopback, metadata or internal services. The address is never recorded.
+      const literal = ipLiteral(url.hostname);
+      let addrs: string[];
+      if (literal) addrs = [literal];
+      else if (!net.lookup) return { ...base, file: prod.file, env: prod.env, outcome: 'skipped', reason: 'no resolver is available to check the address' };
+      else {
+        try {
+          const lookup = net.lookup;
+          addrs = await new Promise<string[]>((resolve, reject) => {
+            const t = setTimeout(() => reject(Object.assign(new Error('lookup timed out'), { name: 'TimeoutError' })), opts.timeoutMs);
+            lookup(url.hostname).then(
+              (v) => (clearTimeout(t), resolve(v)),
+              (e) => (clearTimeout(t), reject(e)),
+            );
+          });
+        } catch (err) {
+          const k = classifyError(err).kind;
+          return { ...base, file: prod.file, env: prod.env, outcome: k === 'unreachable' ? 'dns' : k };
+        }
+      }
+      if (addrs.length === 0) return { ...base, file: prod.file, env: prod.env, outcome: 'dns' };
+      if (addrs.some(isNonPublic)) return { ...base, file: prod.file, env: prod.env, outcome: 'skipped', reason: 'private address (pass --probe-allow-private to probe it)' };
+    }
     const r = await http.request({ url: url.href, method: 'GET', headers: { 'user-agent': 'wirelint' }, manualRedirect: true, discardBody: true });
     return r.ok ? { ...base, file: prod.file, env: prod.env, outcome: 'answered', status: r.status } : { ...base, file: prod.file, env: prod.env, outcome: r.kind };
   });
@@ -166,5 +199,5 @@ export async function runProbe(a: Analysis, opts: ProbeOptions, net: Net): Promi
         : `check that ${r.variable} in ${r.file} names the production host and port of ${r.to}; if ${r.to} is reachable only inside its network, run the probe from there`,
     });
   }
-  return { findings: sink.findings, suppressed: sink.suppressed, probe: { path: opts.path, timeoutMs: opts.timeoutMs, strict: opts.strict, results } };
+  return { findings: sink.findings, suppressed: sink.suppressed, probe: { path: opts.path, timeoutMs: opts.timeoutMs, strict: opts.strict, allowPrivate: !!opts.allowPrivate, complete: true, results } };
 }

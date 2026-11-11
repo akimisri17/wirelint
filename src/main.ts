@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { BASELINE_FILE, check, loadBaseline, renderGithub, renderHuman, renderMarkdown, run, runPr, version, writeBaseline } from './index.js';
 import type { LiveOptions } from './live.js';
-import type { ProbeOptions } from './probe.js';
+import { validProbePath, type ProbeOptions } from './probe.js';
 import { defaultNet, type Net } from './net.js';
 import { REGION_RE } from './ssm.js';
 import type { LiveAdapterName, Report } from './types.js';
@@ -41,6 +41,7 @@ Live checks: opt-in, read-only (list/describe/get calls and GET probes only; not
   --probe-path <path>    probe path (default /health)
   --probe-timeout <s>    probe timeout in seconds (default 5)
   --probe-strict         probe: DNS failure, connection refused and 5xx fail the run
+  --probe-allow-private  probe: also reach loopback, private and link-local addresses (refused by default)
 
 Exit codes: 0 no failures (suggestions never fail), 1 failures, 2 usage error,
 or a requested live check that could not run (failures still exit 1).
@@ -61,7 +62,7 @@ interface Parsed {
 const PR_OPTIONS = ['--base', '--comment-file'];
 const VALUE_OPTIONS = new Set([...PR_OPTIONS, '--live', '--env', '--region', '--vercel-project', '--vercel-team', '--probe-path', '--probe-timeout']);
 const REPEATABLE = new Set(['--live', '--env', '--vercel-project']);
-const FLAGS = new Set(['--json', '--no-hints', '--no-baseline', '--pr', '-h', '--help', '-v', '--version', '--compare', '--probe', '--probe-strict']);
+const FLAGS = new Set(['--json', '--no-hints', '--no-baseline', '--pr', '-h', '--help', '-v', '--version', '--compare', '--probe', '--probe-strict', '--probe-allow-private']);
 const ADAPTERS: LiveAdapterName[] = ['ssm', 'vercel'];
 
 function parse(argv: string[]): Parsed | string {
@@ -150,23 +151,31 @@ function v2Options(flags: Set<string>, values: Map<string, string[]>): V2 | stri
     }
   }
   for (const k of ['--probe-path', '--probe-timeout']) if (values.has(k) && !flags.has('--probe')) return `${k} only applies with --probe`;
-  if (flags.has('--probe-strict') && !flags.has('--probe')) return '--probe-strict only applies with --probe';
+  for (const f of ['--probe-strict', '--probe-allow-private']) if (flags.has(f) && !flags.has('--probe')) return `${f} only applies with --probe`;
   if (flags.has('--probe')) {
     const p = one('--probe-path') ?? '/health';
-    if (!/^\/(?!\/)[^\s#]*$/.test(p)) return '--probe-path must be a path starting with "/", e.g. /health';
+    if (!validProbePath(p)) return '--probe-path must be a plain path starting with "/" (no scheme, host, query, fragment or dot segments), e.g. /health';
     const t = one('--probe-timeout');
     const seconds = t === undefined ? 5 : Number(t);
     if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 60) return '--probe-timeout needs a number of seconds between 0 and 60';
-    out.probe = { path: p, timeoutMs: Math.round(seconds * 1000), strict: flags.has('--probe-strict') };
+    out.probe = { path: p, timeoutMs: Math.round(seconds * 1000), strict: flags.has('--probe-strict'), allowPrivate: flags.has('--probe-allow-private') };
   }
   return out;
 }
 
-/** Say prominently, on stderr, that a requested live check did not run in full. */
+/** Say prominently, on stderr, that a requested live check or probe did not run in full. */
 function liveIncomplete(report: Report, io: Io): boolean {
-  if (!report.live || report.live.complete) return false;
-  for (const s of report.live.adapters) if (!s.complete) io.stderr(`wirelint: live check ${s.adapter} incomplete: ${s.problem}; fix: ${s.fix}\n`);
-  return true;
+  let any = false;
+  for (const s of report.live?.adapters ?? []) {
+    if (s.complete) continue;
+    io.stderr(`wirelint: live check ${s.adapter} incomplete: ${s.problem}; fix: ${s.fix}\n`);
+    any = true;
+  }
+  if (report.probe && !report.probe.complete) {
+    io.stderr(`wirelint: probe incomplete: ${report.probe.problem}; fix: ${report.probe.fix}\n`);
+    any = true;
+  }
+  return any;
 }
 
 export async function main(argv: string[], io: Io = processIo()): Promise<number> {
@@ -225,9 +234,16 @@ export async function main(argv: string[], io: Io = processIo()): Promise<number
   const baseline = flags.has('--no-baseline') ? new Set<string>() : loadBaseline(workspace);
   const prOpts = { base: values.get('--base')?.[0], env: io.env };
   // Without a v2 flag the run is exactly the file-only one: no network, no credentials read.
-  const report = v2Mode
-    ? await check(workspace, baseline, { pr: prMode ? prOpts : undefined, live: v2.live ? { ...v2.live, env: io.env } : undefined, probe: v2.probe }, io.net)
-    : prMode ? runPr(workspace, baseline, prOpts) : run(workspace, baseline);
+  let report: Report;
+  if (v2Mode) {
+    try {
+      report = await check(workspace, baseline, { pr: prMode ? prOpts : undefined, live: v2.live ? { ...v2.live, env: io.env } : undefined, probe: v2.probe }, io.net);
+    } catch {
+      // Never print an unexpected message or stack from a live or probe run: it could quote a value.
+      io.stderr('wirelint: an unexpected error stopped the run; no detail is shown because it could contain a value\n');
+      return 2;
+    }
+  } else report = prMode ? runPr(workspace, baseline, prOpts) : run(workspace, baseline);
   if (report.services.length === 0) {
     io.stderr(`wirelint: no services found under ${workspace} (looked for child directories with a package.json or a .git)\n`);
     return 2;

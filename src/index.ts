@@ -83,6 +83,12 @@ export interface CheckOptions {
   probe?: ProbeOptions;
 }
 
+/** Shown instead of any unexpected error from a live or probe path, whose message could quote a value. */
+const UNEXPECTED = {
+  problem: 'an unexpected error stopped this check; no detail is shown because it could contain a value',
+  fix: 'run it again; if it persists, report it with the command line (not the output of a debugger)',
+};
+
 const RANK: Record<Severity, number> = { error: 0, hint: 1, info: 2 };
 
 /**
@@ -99,17 +105,33 @@ export async function check(workspace: string, baseline: Set<string> = new Set()
   let suppressed = 0;
   let live: Report['live'];
   if (opts.live) {
-    const r = await runLive(a, opts.live, net);
-    extra.push(...r.findings);
-    suppressed += r.suppressed;
-    live = r.live;
+    try {
+      const r = await runLive(a, opts.live, net);
+      extra.push(...r.findings);
+      suppressed += r.suppressed;
+      live = r.live;
+    } catch {
+      // The message could quote a value from an unexpected upstream answer; it is never shown.
+      live = {
+        adapters: opts.live.adapters.map((adapter) => ({ adapter, complete: false, requests: 0, checked: 0, ...UNEXPECTED })),
+        compare: !!opts.live.compare,
+        ...(opts.live.envs ? { envs: opts.live.envs } : {}),
+        checks: [],
+        comparisons: [],
+        complete: false,
+      };
+    }
   }
   let probe: Report['probe'];
   if (opts.probe) {
-    const r = await runProbe(a, opts.probe, net);
-    extra.push(...r.findings);
-    suppressed += r.suppressed;
-    probe = r.probe;
+    try {
+      const r = await runProbe(a, opts.probe, net);
+      extra.push(...r.findings);
+      suppressed += r.suppressed;
+      probe = r.probe;
+    } catch {
+      probe = { path: opts.probe.path, timeoutMs: opts.probe.timeoutMs, strict: opts.probe.strict, allowPrivate: !!opts.probe.allowPrivate, complete: false, ...UNEXPECTED, results: [] };
+    }
   }
   const all = [...a.findings, ...extra].sort(
     (x, y) => RANK[x.severity] - RANK[y.severity] || x.service.localeCompare(y.service) || x.check.localeCompare(y.check) || x.variable.localeCompare(y.variable),
