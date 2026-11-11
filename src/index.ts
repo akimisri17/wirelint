@@ -4,6 +4,7 @@ import { runLive, type LiveOptions } from './live.js';
 import { isPlatformVar } from './names.js';
 import { defaultNet, type Net } from './net.js';
 import { scanPr, type PrOptions } from './pr.js';
+import { runProbe, type ProbeOptions } from './probe.js';
 import type { Finding, Report, Severity } from './types.js';
 
 export { analyze } from './analyze.js';
@@ -11,6 +12,7 @@ export { loadBaseline, writeBaseline, BASELINE_FILE } from './baseline.js';
 export { renderGithub, renderHuman, renderMarkdown } from './render.js';
 export type { PrOptions } from './pr.js';
 export type { LiveOptions } from './live.js';
+export type { ProbeOptions } from './probe.js';
 export type { Net } from './net.js';
 export type * from './types.js';
 
@@ -77,14 +79,16 @@ export interface CheckOptions {
   pr?: PrOptions;
   /** Live adapters (`--live`), read-only. */
   live?: LiveOptions;
+  /** Probe mode (`--probe`): GET each inferred link's production base URL plus a path. */
+  probe?: ProbeOptions;
 }
 
 const RANK: Record<Severity, number> = { error: 0, hint: 1, info: 2 };
 
 /**
  * The full run: the file analysis, PR mode when asked, then the opt-in live
- * checks. All network traffic goes through `net`; without `live` (or a probe)
- * it is never called. Findings from live checks go through the PR filter too,
+ * checks and probes. All network traffic goes through `net`; without `live`
+ * or `probe` it is never called. Findings from live checks go through the PR filter too,
  * so PR mode reports only what concerns the variables the diff adds.
  */
 export async function check(workspace: string, baseline: Set<string> = new Set(), opts: CheckOptions = {}, net: Net = defaultNet()): Promise<Report> {
@@ -100,6 +104,13 @@ export async function check(workspace: string, baseline: Set<string> = new Set()
     suppressed += r.suppressed;
     live = r.live;
   }
+  let probe: Report['probe'];
+  if (opts.probe) {
+    const r = await runProbe(a, opts.probe, net);
+    extra.push(...r.findings);
+    suppressed += r.suppressed;
+    probe = r.probe;
+  }
   const all = [...a.findings, ...extra].sort(
     (x, y) => RANK[x.severity] - RANK[y.severity] || x.service.localeCompare(y.service) || x.check.localeCompare(y.check) || x.variable.localeCompare(y.variable),
   );
@@ -107,6 +118,7 @@ export async function check(workspace: string, baseline: Set<string> = new Set()
   report.summary.suppressed += suppressed;
   if (pr) report.pr = pr.summary;
   if (live) report.live = live;
+  if (probe) report.probe = probe;
   report.summary.durationMs = Math.round(performance.now() - started);
   return report;
 }

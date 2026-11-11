@@ -93,6 +93,16 @@ export function renderHuman(report: Report, opts: { width?: number; hints?: bool
       }
     }
   }
+  if (report.probe) {
+    const p = report.probe;
+    out.push('', `PROBES (${p.results.length}) - GET ${p.path}, ${p.timeoutMs / 1000}s timeout, no redirects followed, no credentials sent; addresses are not shown`);
+    if (!p.results.length) out.push('  no inferred links to probe');
+    for (const r of p.results) {
+      const src = r.file ? `  [${r.file}${r.env && r.env !== '*' ? `, ${r.env}` : ''}]` : '';
+      const what = r.outcome === 'answered' ? `answered ${r.status}` : r.outcome === 'skipped' ? `not probed: ${r.reason}` : r.outcome;
+      out.push(`  ${r.from} -> ${r.to}  via ${r.variable}${src}  ${what}`);
+    }
+  }
   if (notes.length) {
     out.push('', `NOT ANALYSED (${notes.length})`);
     for (const n of notes) out.push(`  ${n.service}: ${n.problem}`);

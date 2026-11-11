@@ -192,3 +192,45 @@ describe('usage errors', () => {
     expect(net.calls).toHaveLength(0);
   });
 });
+
+describe('--pr with --live', () => {
+  it('keeps live findings only for variables the diff adds, and puts them in the comment body', async () => {
+    const { spawnSync } = await import('node:child_process');
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const { pkg, workspace } = await import('./helpers.js');
+    const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+    const git = (cwd: string, ...args: string[]) => {
+      const r = spawnSync('git', args, { cwd, encoding: 'utf8', env: gitEnv });
+      if (r.status !== 0) throw new Error(r.stderr);
+    };
+    const manifest = (extra: string) => `name: api\ntype: Backend Service\nsecrets:\n  OLD_KEY: /api/OLD_KEY\n${extra}environments:\n  prod:\n`;
+    const ws = workspace({
+      'api/package.json': pkg('api'),
+      'api/.env.example': 'OLD_KEY=\n',
+      'api/src/a.ts': 'export const o = process.env.OLD_KEY!;\n',
+      'api/copilot/api/manifest.yml': manifest(''),
+    });
+    const repo = path.join(ws, 'api');
+    git(repo, 'init', '-q', '-b', 'main');
+    git(repo, 'add', '-A');
+    git(repo, '-c', 'user.name=t', '-c', 'user.email=t@example.test', '-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'base');
+    git(repo, 'checkout', '-q', '-b', 'feature');
+    fs.writeFileSync(path.join(repo, '.env.example'), 'OLD_KEY=\nNEW_KEY=\n');
+    fs.writeFileSync(path.join(repo, 'src/a.ts'), 'export const o = process.env.OLD_KEY!;\nexport const n = process.env.NEW_KEY!;\n');
+    fs.writeFileSync(path.join(repo, 'copilot/api/manifest.yml'), manifest('  NEW_KEY: /api/NEW_KEY\n'));
+    git(repo, 'add', '-A');
+    git(repo, '-c', 'user.name=t', '-c', 'user.email=t@example.test', '-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'add');
+
+    const net = fakeCloud({ params: { 'eu-west-1': {} } });
+    const commentFile = path.join(ws, 'comment.md');
+    const r = await cli(['--pr', '--base', 'main', '--comment-file', commentFile, '--live', 'ssm', ws], { env: AWS, net });
+    expect(r.code).toBe(1);
+    expect(r.out).toContain('NEW_KEY');
+    expect(r.out).not.toMatch(/live-missing.*OLD_KEY|OLD_KEY\s+api\/copilot/);
+    const body = fs.readFileSync(commentFile, 'utf8');
+    expect(body).toContain('`api` `NEW_KEY` `api/copilot/api/manifest.yml`: secrets.NEW\\_KEY references an SSM parameter that does not exist');
+    expect(body).not.toContain('OLD\\_KEY references');
+    expect(body).toContain('files plus read-only live checks');
+  });
+});

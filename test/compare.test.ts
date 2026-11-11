@@ -54,7 +54,7 @@ describe('--compare', () => {
     expect(f!.problem).toBe(
       'declared same-as identity.JWT_SECRET, but the deployed values differ for prod (orders: the SSM parameter secrets.JWT_SECRET in orders/copilot/orders/manifest.yml names; identity: the SSM parameter secrets.JWT_SECRET in identity/copilot/identity/manifest.yml names)',
     );
-    expect(f!.fix).toBe("set orders's value to identity's for prod, or point both at one parameter; wirelint compared keyed digests and shows neither value");
+    expect(f!.fix).toBe('copy the prod value of identity.JWT_SECRET into orders.JWT_SECRET, or point both at one parameter; wirelint compared keyed digests and shows neither value');
     const outputs = [r.out, renderHuman(report), renderGithub(report, fixture('live')), renderMarkdown(report)].join('\n');
     for (const v of ['drifted-jwt-value', 'shared-jwt-value']) expect(outputs).not.toContain(v);
     expect(outputs).not.toMatch(/[0-9a-f]{64}/);
@@ -67,7 +67,7 @@ describe('--compare', () => {
     expect(report.live!.comparisons.find((c) => c.kind === 'inferred')).toMatchObject({ env: 'prod', result: 'different' });
     const [hint] = find(report, 'live-mismatch', 'SESSION_SECRET');
     expect(hint).toMatchObject({ severity: 'hint', service: 'identity + web', env: 'prod' });
-    expect(hint!.fix).toContain('add "# wirelint: same-as web" to SESSION_SECRET in identity\'s .env.example');
+    expect(hint!.fix).toContain('add "# wirelint: same-as web" to SESSION_SECRET in the .env.example of identity');
     expect(net.calls.filter((c) => c.url.host === 'api.vercel.com').map((c) => `${c.method} ${c.url.pathname}`)).toEqual(['GET /v9/projects/prj_demoweb0000/env', 'GET /v1/projects/prj_demoweb0000/env/env_9']);
   });
 

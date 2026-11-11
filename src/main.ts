@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { BASELINE_FILE, check, loadBaseline, renderGithub, renderHuman, renderMarkdown, run, runPr, version, writeBaseline } from './index.js';
 import type { LiveOptions } from './live.js';
+import type { ProbeOptions } from './probe.js';
 import { defaultNet, type Net } from './net.js';
 import { REGION_RE } from './ssm.js';
 import type { LiveAdapterName, Report } from './types.js';
@@ -26,7 +27,7 @@ Options
   -h, --help             show this help
   -v, --version          show the version
 
-Live checks: opt-in, read-only (list/describe/get calls only; nothing is written)
+Live checks: opt-in, read-only (list/describe/get calls and GET probes only; nothing is written)
   --live <adapters>      ssm, vercel or ssm,vercel: check that what deploy config relies on exists
                          ssm: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY [, AWS_SESSION_TOKEN] from the environment
                          vercel: VERCEL_TOKEN from the environment
@@ -36,6 +37,10 @@ Live checks: opt-in, read-only (list/describe/get calls only; nothing is written
   --vercel-project <service>=<projectId>
                          vercel: project for a service without .vercel/project.json (repeatable)
   --vercel-team <teamId> vercel: team (default .vercel/project.json orgId, else $VERCEL_TEAM_ID)
+  --probe                GET each inferred link's production base URL plus a health path
+  --probe-path <path>    probe path (default /health)
+  --probe-timeout <s>    probe timeout in seconds (default 5)
+  --probe-strict         probe: DNS failure, connection refused and 5xx fail the run
 
 Exit codes: 0 no failures (suggestions never fail), 1 failures, 2 usage error,
 or a requested live check that could not run (failures still exit 1).
@@ -54,9 +59,9 @@ interface Parsed {
 }
 
 const PR_OPTIONS = ['--base', '--comment-file'];
-const VALUE_OPTIONS = new Set([...PR_OPTIONS, '--live', '--env', '--region', '--vercel-project', '--vercel-team']);
+const VALUE_OPTIONS = new Set([...PR_OPTIONS, '--live', '--env', '--region', '--vercel-project', '--vercel-team', '--probe-path', '--probe-timeout']);
 const REPEATABLE = new Set(['--live', '--env', '--vercel-project']);
-const FLAGS = new Set(['--json', '--no-hints', '--no-baseline', '--pr', '-h', '--help', '-v', '--version', '--compare']);
+const FLAGS = new Set(['--json', '--no-hints', '--no-baseline', '--pr', '-h', '--help', '-v', '--version', '--compare', '--probe', '--probe-strict']);
 const ADAPTERS: LiveAdapterName[] = ['ssm', 'vercel'];
 
 function parse(argv: string[]): Parsed | string {
@@ -100,6 +105,7 @@ const processIo = (): Io => ({
 
 interface V2 {
   live?: Omit<LiveOptions, 'env'>;
+  probe?: ProbeOptions;
 }
 
 /** The v2 options, or a usage error. Nothing here touches the network or credentials. */
@@ -143,6 +149,16 @@ function v2Options(flags: Set<string>, values: Map<string, string[]>): V2 | stri
       out.live.vercelTeam = team;
     }
   }
+  for (const k of ['--probe-path', '--probe-timeout']) if (values.has(k) && !flags.has('--probe')) return `${k} only applies with --probe`;
+  if (flags.has('--probe-strict') && !flags.has('--probe')) return '--probe-strict only applies with --probe';
+  if (flags.has('--probe')) {
+    const p = one('--probe-path') ?? '/health';
+    if (!/^\/(?!\/)[^\s#]*$/.test(p)) return '--probe-path must be a path starting with "/", e.g. /health';
+    const t = one('--probe-timeout');
+    const seconds = t === undefined ? 5 : Number(t);
+    if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 60) return '--probe-timeout needs a number of seconds between 0 and 60';
+    out.probe = { path: p, timeoutMs: Math.round(seconds * 1000), strict: flags.has('--probe-strict') };
+  }
   return out;
 }
 
@@ -179,7 +195,7 @@ export async function main(argv: string[], io: Io = processIo()): Promise<number
     io.stderr(`wirelint: ${v2}\n`);
     return 2;
   }
-  const v2Mode = !!v2.live;
+  const v2Mode = !!(v2.live || v2.probe);
   const baselineMode = args[0] === 'baseline';
   if (baselineMode) args.shift();
   if (baselineMode && prMode) {
@@ -187,7 +203,7 @@ export async function main(argv: string[], io: Io = processIo()): Promise<number
     return 2;
   }
   if (baselineMode && v2Mode) {
-    io.stderr('wirelint: baseline records file findings only; run it without --live\n');
+    io.stderr('wirelint: baseline records file findings only; run it without --live or --probe\n');
     return 2;
   }
   if (args.length > 1) {
@@ -210,7 +226,7 @@ export async function main(argv: string[], io: Io = processIo()): Promise<number
   const prOpts = { base: values.get('--base')?.[0], env: io.env };
   // Without a v2 flag the run is exactly the file-only one: no network, no credentials read.
   const report = v2Mode
-    ? await check(workspace, baseline, { pr: prMode ? prOpts : undefined, live: v2.live ? { ...v2.live, env: io.env } : undefined}, io.net)
+    ? await check(workspace, baseline, { pr: prMode ? prOpts : undefined, live: v2.live ? { ...v2.live, env: io.env } : undefined, probe: v2.probe }, io.net)
     : prMode ? runPr(workspace, baseline, prOpts) : run(workspace, baseline);
   if (report.services.length === 0) {
     io.stderr(`wirelint: no services found under ${workspace} (looked for child directories with a package.json or a .git)\n`);

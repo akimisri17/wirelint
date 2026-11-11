@@ -530,7 +530,7 @@ async function runCompare(ctx: LiveRun, relations: Relation[], candidates: Secre
           line: p.relation!.line,
           env,
           problem: `declared same-as ${p.b.service}.${p.b.variable}, but the deployed values differ for ${env} (${both})`,
-          fix: `set ${p.a.service}'s value to ${p.b.service}'s for ${env}, or point both at one parameter; wirelint compared keyed digests and shows neither value`,
+          fix: `copy the ${env} value of ${p.b.service}.${p.b.variable} into ${p.a.service}.${p.a.variable}, or point both at one parameter; wirelint compared keyed digests and shows neither value`,
         });
       } else {
         const label = p.a.variable === p.b.variable ? p.a.variable : `${p.a.variable} / ${p.b.variable}`;
@@ -542,7 +542,7 @@ async function runCompare(ctx: LiveRun, relations: Relation[], candidates: Secre
           anchor: '',
           env,
           problem: `the deployed values differ for ${env} (${both}); if this is one shared secret, calls between them fail authentication`,
-          fix: `if they must match, set one value in both and add "# wirelint: same-as ${p.b.service}${p.a.variable === p.b.variable ? '' : `.${p.b.variable}`}" to ${p.a.variable} in ${p.a.service}'s .env.example; if they are independent, nothing to do`,
+          fix: `if they must match, set one value in both and add "# wirelint: same-as ${p.b.service}${p.a.variable === p.b.variable ? '' : `.${p.b.variable}`}" to ${p.a.variable} in the .env.example of ${p.a.service}; if they are independent, nothing to do`,
         });
       }
     }

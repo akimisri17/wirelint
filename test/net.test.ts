@@ -130,6 +130,9 @@ describe('Http', () => {
     expect(safeCode('forbidden')).toBe('forbidden');
     expect(safeCode('token sk_live_abc')).toBeNull();
     expect(safeCode(42)).toBeNull();
+    expect(safeCode('not_found')).toBe('not_found');
+    expect(safeCode('aB3xYz9QweRtyUi0pAsDfGhJ')).toBeNull();
+    expect(safeCode('AKIAABCDEFGHIJKLMNOP')).toBeNull();
   });
 
   it('pools work with a cap and keeps order', async () => {

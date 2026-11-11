@@ -105,18 +105,21 @@ export class Http {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs);
     this.requests++;
+    // The deadline holds even if a fetch implementation ignores the signal.
+    const deadline = new Promise<never>((_resolve, reject) => controller.signal.addEventListener('abort', () => reject(Object.assign(new Error('timeout'), { name: 'TimeoutError' }))));
+    deadline.catch(() => undefined);
     try {
-      const res = await this.net.fetch(spec.url, {
+      const res = await Promise.race([this.net.fetch(spec.url, {
         method: spec.method,
         headers: spec.headers,
         body: spec.body,
         redirect: spec.manualRedirect ? 'manual' : 'follow',
         credentials: 'omit',
         signal: controller.signal,
-      });
+      }), deadline]);
       let body = '';
-      if (spec.discardBody) await res.body?.cancel().catch(() => undefined);
-      else body = await res.text();
+      if (spec.discardBody) void res.body?.cancel().catch(() => undefined);
+      else body = await Promise.race([res.text(), deadline]);
       return { ok: true, status: res.status, headers: res.headers, body };
     } catch (e) {
       return { ok: false, ...(controller.signal.aborted ? { kind: 'timeout' as const } : classifyError(e)) };
@@ -158,13 +161,14 @@ export async function pool<T, R>(items: T[], limit: number, fn: (item: T) => Pro
 }
 
 /**
- * An identifier from an upstream error, or null. Only a short run of letters,
- * digits, dots and underscores survives, so a message, an ARN, an account id
- * or a value can never come through this path.
+ * An identifier from an upstream error, or null. Only the two shapes real
+ * error codes take survive: PascalCase words (AccessDeniedException) and
+ * lower snake case (not_found). No digits, spaces or punctuation, so a
+ * message, an ARN, an account id, a token or a value cannot come through.
  */
 export function safeCode(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
   // `ns#Code` in AWS JSON bodies, `Code:http://...` in the x-amzn-ErrorType header.
   const tail = raw.split('#').pop()!.replace(/:https?:\/\/\S*$/, '').trim();
-  return /^[A-Za-z][A-Za-z0-9_.]{0,63}$/.test(tail) && !/\d{6,}/.test(tail) ? tail : null;
+  return tail.length <= 64 && (/^(?:[A-Z][a-z]+)+$/.test(tail) || /^[a-z]+(?:_[a-z]+)*$/.test(tail)) ? tail : null;
 }
