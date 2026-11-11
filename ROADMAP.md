@@ -33,20 +33,29 @@ comment body is written to a file; posting it is left to the user's CI step.
 Value equality for `same-as` is not checked in v1. The relation is kept in
 the JSON report (`relations`, with `compared: "existence"`) for v2.
 
-## v2: look at what is actually deployed, opt-in
+### v2 (0.3.0): look at what is actually deployed, opt-in
 
-**Live adapters for AWS SSM and Vercel.** Off by default, enabled per run,
-read-only credentials supplied by the caller.
+Off by default, enabled per run, read-only, with credentials supplied by the
+caller through the environment.
 
-- Existence checks by default: is the parameter there, for this environment.
-- Value comparison only on request, only in memory, and only as a per-run
-  keyed HMAC. Two services' values are compared by digest; the key is random
-  per run and discarded, so nothing comparable is ever written or printed.
+**Live adapters for AWS SSM and Vercel** (`--live ssm`, `--live vercel`).
 
-**Probe mode.** Vercel sensitive variables cannot be read back, so existence
-is the most an adapter can report for them. Probe mode instead calls each
-inferred dependency's health URL from the resolved base URL and reports what
-answers. It tests the wiring end to end without reading a single secret.
+- Existence checks by default: does every SSM parameter a Copilot manifest
+  references exist for each environment (`DescribeParameters`, names only),
+  and is every required variable set for production in the Vercel project
+  (keys and targets, not decrypted).
+- Value comparison only on request (`--compare`), only in memory, and only as
+  a per-run keyed HMAC. Two services' values are compared by digest; the key
+  is random per run and discarded, so nothing comparable is ever written or
+  printed. Vercel sensitive variables cannot be read back, so existence is
+  the most an adapter reports for them.
+
+**Probe mode** (`--probe`). Calls each inferred dependency's health URL from
+the resolved production base URL and reports what answers, by variable name
+and status class only. It tests the wiring end to end without reading a
+single secret. Results are suggestions unless `--probe-strict`.
+
+Built against the documented APIs and tested with simulated responses.
 
 ## Not planned
 

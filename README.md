@@ -5,13 +5,15 @@ Catch cross-service environment-variable mistakes before they deploy.
 One command, no config file, no cloud credentials, no network. It reads the
 code and the config files already in your repos, works out which variables each
 service needs, and checks that they are declared, shaped correctly and set in
-every deploy environment.
+every deploy environment. Looking at what is actually deployed is opt-in and
+read-only (see [Live checks](#live-checks-opt-in)); without those flags nothing
+leaves your machine.
 
 ```bash
 npx wirelint ../my-workspace
 ```
 
-> **Status: v1 (0.2.0), private, not yet on npm.** Until it is published, run it from a
+> **Status: v2 (0.3.0), private, not yet on npm.** Until it is published, run it from a
 > clone: `npm install && npm run build && node dist/cli.js <workspace-dir>`.
 
 ## Who it is for
@@ -106,13 +108,14 @@ values (`${HOST}`, `<your-url>`, `your-domain`), and platform variables
 
 ## What v0 does not do
 
-- **It does not read live cloud config.** Nothing is fetched from AWS SSM,
-  Secrets Manager or the Vercel API. A variable set only in a dashboard is
-  invisible to it. For a service deployed on Vercel that means the
-  deploy-manifest check does not run at all.
-- **It does not compare secrets against live stores.** It cannot tell you that
-  two services hold different values for a shared secret. It can only tell you
-  that they probably should hold the same one.
+- **By default it does not read live cloud config.** Nothing is fetched from
+  AWS SSM, Secrets Manager or the Vercel API unless you pass `--live`. Without
+  it, a variable set only in a dashboard is invisible, and for a service
+  deployed on Vercel the deploy-manifest check does not run at all.
+- **By default it does not compare secrets against live stores.** It can only
+  tell you that two services probably should hold the same value. `--live
+  --compare` checks whether they do (see [Live checks](#live-checks-opt-in)).
+  Secrets Manager is never read.
 - **It does not know what is actually deployed.** It checks the files in the
   checkout, on the branch you are on.
 - No Kubernetes or Helm, no dashboards, no hosted service, no secret syncing,
@@ -241,6 +244,146 @@ jobs:
 `fetch-depth: 0` matters: without history, `origin/<base>` is not in the
 checkout and the repository is skipped.
 
+## Live checks (opt-in)
+
+Off unless you ask, per run. Every flag is read-only: wirelint makes only
+list, describe and get calls, and GET requests for probes. It never creates,
+updates or deletes anything. Credentials are read from the environment only,
+used for the request and not stored.
+
+```bash
+wirelint --live ssm [--env prod] [--region eu-west-1] .      # SSM parameters the Copilot manifests reference exist
+wirelint --live vercel [--vercel-project web=prj_123] .      # required variables are set in the Vercel project
+wirelint --live ssm,vercel --compare .                       # same-as values are equal, compared as keyed digests
+wirelint --probe [--probe-path /health] [--probe-strict] .   # each inferred link answers in production
+```
+
+The adapters were built against the documented AWS SSM and Vercel REST APIs
+and tested with simulated responses only (a fake `fetch` that answers in the
+documented shapes, including pagination, throttling and errors). They have not
+been run against a real account by this project yet.
+
+**`--live ssm`** reads `secrets:` in each Copilot manifest, top-level and per
+environment, with `${COPILOT_ENVIRONMENT_NAME}` and
+`${COPILOT_APPLICATION_NAME}` (from `copilot/.workspace`) filled in, and SSM
+parameter ARNs. Environments come from the manifest's `environments:` block
+and `copilot/environments/`; `--env` restricts them. It asks
+`DescribeParameters` with a name filter, which returns names and metadata and
+never values. Credentials: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and,
+for temporary credentials, `AWS_SESSION_TOKEN`; region from `--region`, else
+`AWS_REGION`, else `AWS_DEFAULT_REGION` (an ARN's own region wins for that
+parameter). Secrets Manager references (`secretsmanager:` or an ARN) and
+anything it cannot resolve are listed as not checked, never failed.
+
+The minimum IAM policy for existence checks:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "ssm:DescribeParameters", "Resource": "*" }
+  ]
+}
+```
+
+`--compare` additionally needs to read values, so scope it to the parameters
+and the key that encrypts them:
+
+```json
+{ "Effect": "Allow", "Action": "ssm:GetParameters", "Resource": "arn:aws:ssm:<region>:<account-id>:parameter/copilot/<app>/*" },
+{ "Effect": "Allow", "Action": "kms:Decrypt", "Resource": "<arn of the KMS key the parameters use>" }
+```
+
+**`--live vercel`** applies to services with a `vercel.json`, a
+`.vercel/project.json` (written by `vercel link`) or a `--vercel-project
+<service>=<projectId>`. It lists the project's variables with
+`GET /v9/projects/{id}/env`: keys, targets and types, not decrypted; any value
+in the answer is dropped when it is parsed. A required variable (graded
+exactly like `missing-from-deploy`, plus `build-time` variables, because one
+Vercel store serves both) that is not set for `production` fails; gaps in
+`preview` and `development` are suggestions. Token: `VERCEL_TOKEN`. Team:
+`--vercel-team`, else the `orgId` in `.vercel/project.json`, else
+`VERCEL_TEAM_ID`. Create the token under Account Settings > Tokens, scoped to
+the team that owns the projects. Vercel tokens cannot be made read-only, so
+keep it in your CI secrets even though wirelint only sends GET requests. A
+Vercel service with no linked project is a note with the fix, not a failure.
+
+**`--compare`** (needs `--live`) compares both sides of every `same-as`
+relation, and of every `shared-secret` suggestion, in each environment both
+sides have (a Copilot production environment meets the Vercel `production`
+target). Each value is reduced on arrival to an HMAC-SHA256 digest under a
+random 32-byte key that is generated once per run and kept only in memory, and
+the plaintext is dropped. The digests are compared in constant time and never
+printed or written, and because the key dies with the run, nothing comparable
+outlives it. A difference fails for a declared `same-as` and is a suggestion
+for an inferred pair. Vercel `sensitive` variables cannot be read back by
+design, so for them only existence is reported. In `--json`, a relation's
+`compared` becomes `value` or `unreadable`.
+
+**`--probe`** (works with or without `--live`) takes, for each inferred link,
+the base URL the calling service uses in production (a deploy target's
+production environment, else `vercel.json`, else a production `.env` file,
+never a local or example one) and sends `GET <base><--probe-path>`,
+default `/health`. http and https only, a timeout (`--probe-timeout`,
+default 5 seconds), no redirects followed, no cookies, credentials or custom
+headers, only `User-Agent: wirelint`. Results name the variable, never the
+URL or host. A probe from a laptop that cannot reach a service proves nothing
+(private DNS, a VPC, an allowlist), so results are suggestions;
+`--probe-strict` makes DNS failure, connection refused and 5xx answers fail,
+for a runner that sits inside the network.
+
+**When a check cannot run**, wirelint says so at the top of the report
+(`LIVE CHECK INCOMPLETE`), on stderr and as a GitHub warning, and exits `2`:
+missing or rejected credentials, access denied, an unreachable endpoint, or
+throttling that did not stop after bounded retries. Failures still exit `1`.
+Upstream error messages are never quoted, only an error code such as
+`AccessDeniedException`, because they can contain account ids and ARNs.
+
+Example failures and fixes:
+
+```
+orders  JWT_SECRET  orders/copilot/orders/manifest.yml  (live-missing, env dev)
+        secrets.JWT_SECRET references an SSM parameter that does not exist in eu-west-1 for
+        environment dev; tasks that need it fail to start
+        fix: create the parameter that secrets.JWT_SECRET in orders/copilot/orders/manifest.yml
+             names, in eu-west-1 (copilot secret init --name JWT_SECRET creates and tags it), or
+             correct the reference
+
+web     NEXT_PUBLIC_SITE_NAME  web/.vercel/project.json  (live-missing, env production)
+        read in web/src/api.ts:3 (no default) but the Vercel project does not set it for production
+        fix: in web, run "vercel env add NEXT_PUBLIC_SITE_NAME production" (or add it under
+             Settings > Environment Variables)
+
+orders  JWT_SECRET  orders/.env.example:2  (live-mismatch, env prod)
+        declared same-as identity.JWT_SECRET, but the deployed values differ for prod (orders: the
+        SSM parameter secrets.JWT_SECRET in orders/copilot/orders/manifest.yml names; identity: the
+        SSM parameter secrets.JWT_SECRET in identity/copilot/identity/manifest.yml names)
+        fix: copy the prod value of identity.JWT_SECRET into orders.JWT_SECRET, or point both at one
+             parameter; wirelint compared keyed digests and shows neither value
+
+web     ORDERS_API_URL  web/.env.production  (probe-unreachable, with --probe-strict)
+        GET /health on the production ORDERS_API_URL (web/.env.production, prod) refused the connection
+        fix: check that ORDERS_API_URL in web/.env.production names the production host and port of
+             orders; if orders is reachable only inside its network, run the probe from there
+```
+
+| Check | With | Fails when |
+| --- | --- | --- |
+| `live-missing` | `--live ssm` | a manifest references an SSM parameter that does not exist for an environment |
+| `live-missing` | `--live vercel` | a required variable is not set for `production` in the Vercel project (other targets: suggestion) |
+| `live-mismatch` | `--compare` | a declared `same-as` pair holds different deployed values (an inferred pair: suggestion) |
+| `probe-unreachable` | `--probe` | never, unless `--probe-strict` and DNS fails or the connection is refused |
+| `probe-status` | `--probe` | never, unless `--probe-strict` and the answer is a 5xx |
+| `live-not-checked`, `probe-not-checked` | | never; a note saying what was not checked and why |
+
+`--json` gains a `live` section (adapters with `complete`, `requests`,
+`problem` and `fix`; per-variable `checks`; `comparisons` with `equal`,
+`different`, `unreadable` or `not-checked`) and a `probe` section (per link:
+variable, status class and HTTP code). Neither ever holds a value, a digest,
+a token, a parameter name or an address. With `--pr`, live and probe findings
+are filtered to the variables the diff adds, like every other finding, and
+appear in the comment body.
+
 ## Secrets
 
 Values are kept only for example files. For every other file the value is
@@ -255,10 +398,11 @@ wirelint [workspace-dir]            # table: service, variable, where, problem, 
 wirelint --json [workspace-dir]     # the same report as JSON
 wirelint --no-hints [workspace-dir] # hide suggestions
 wirelint --pr [workspace-dir]       # only what this branch adds (see PR mode)
+wirelint --live ssm,vercel --probe  # opt-in, read-only live checks (see Live checks)
 ```
 
 Exit code `1` when there are failures, `0` when there are only suggestions,
-`2` for a usage error. When `GITHUB_ACTIONS` is set it also emits
+`2` for a usage error or for a requested live check that could not run. When `GITHUB_ACTIONS` is set it also emits
 `::error file=...,line=...` annotations, so findings land on the right line of
 a pull request:
 
