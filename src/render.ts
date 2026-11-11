@@ -47,7 +47,7 @@ export function renderHuman(report: Report, opts: { width?: number; hints?: bool
   const { summary: s } = report;
   const vars = report.services.reduce((n, svc) => n + svc.variablesRead, 0);
   const out: string[] = [];
-  out.push(`wirecheck ${report.version}: ${report.services.length} services, ${vars} variables read, ${(s.durationMs / 1000).toFixed(2)}s`);
+  out.push(`wirelint ${report.version}: ${report.services.length} services, ${vars} variables read, ${(s.durationMs / 1000).toFixed(2)}s`);
 
   const errors = report.findings.filter((f) => f.severity === 'error');
   const hints = report.findings.filter((f) => f.severity === 'hint');
@@ -67,7 +67,7 @@ export function renderHuman(report: Report, opts: { width?: number; hints?: bool
     '',
     `${s.failures} failure${s.failures === 1 ? '' : 's'}, ${s.suggestions} suggestion${s.suggestions === 1 ? '' : 's'}` +
       (extras.length ? ` (${extras.join(', ')})` : '') +
-      (s.failures ? '. Fix them, or run "wirecheck baseline" to accept the current state.' : '.'),
+      (s.failures ? '. Fix them, or run "wirelint baseline" to accept the current state.' : '.'),
   );
   return out.join('\n');
 }
@@ -86,7 +86,7 @@ export function renderGithub(report: Report, repoRoot: string): string {
       props.push(`file=${escProp(path.relative(repoRoot, path.join(report.workspace, f.file)).split(path.sep).join('/'))}`);
       if (f.line) props.push(`line=${f.line}`);
     }
-    props.push(`title=${escProp(`wirecheck ${f.check}: ${f.variable}`)}`);
+    props.push(`title=${escProp(`wirelint ${f.check}: ${f.variable}`)}`);
     lines.push(`::${level} ${props.join(',')}::${escData(`[${f.service}] ${f.variable} ${f.problem}. Fix: ${f.fix}`)}`);
   }
   return lines.join('\n');

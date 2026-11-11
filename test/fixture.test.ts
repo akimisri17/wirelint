@@ -70,7 +70,7 @@ describe('fixture: four sibling services', () => {
   it('emits GitHub annotations with paths relative to the repository root', () => {
     const lines = renderGithub(report, fixture('')).split('\n');
     expect(lines).toContain(
-      '::error file=shop/storefront/.env.example,line=4,title=wirecheck url-shape%3A NEXT_PUBLIC_SITE_URL::[storefront] NEXT_PUBLIC_SITE_URL "http://localhost:3000/" ends with a trailing slash; clients append their own path to a base URL, so requests hit a doubled or malformed path. Fix: set NEXT_PUBLIC_SITE_URL=http://localhost:3000',
+      '::error file=shop/storefront/.env.example,line=4,title=wirelint url-shape%3A NEXT_PUBLIC_SITE_URL::[storefront] NEXT_PUBLIC_SITE_URL "http://localhost:3000/" ends with a trailing slash; clients append their own path to a base URL, so requests hit a doubled or malformed path. Fix: set NEXT_PUBLIC_SITE_URL=http://localhost:3000',
     );
     expect(lines.filter((l) => l.startsWith('::error '))).toHaveLength(13);
     expect(lines.filter((l) => l.startsWith('::notice '))).toHaveLength(4);

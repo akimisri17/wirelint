@@ -1,4 +1,4 @@
-# wirecheck
+# wirelint
 
 Catch cross-service environment-variable mistakes before they deploy.
 
@@ -8,12 +8,11 @@ service needs, and checks that they are declared, shaped correctly and set in
 every deploy environment.
 
 ```bash
-npx wirecheck ../my-workspace
+npx wirelint ../my-workspace
 ```
 
-> **Status: v0, private.** The name `wirecheck` is taken on npm by an unrelated
-> package, so the published name is still open. Until then, run it from a clone:
-> `npm install && npm run build && node dist/cli.js <workspace-dir>`.
+> **Status: v0, private, not yet on npm.** Until it is published, run it from a
+> clone: `npm install && npm run build && node dist/cli.js <workspace-dir>`.
 
 ## Who it is for
 
@@ -125,9 +124,9 @@ Findings from those files describe the problem without quoting the value.
 ## Output
 
 ```bash
-wirecheck [workspace-dir]            # table: service, variable, where, problem, fix
-wirecheck --json [workspace-dir]     # the same report as JSON
-wirecheck --no-hints [workspace-dir] # hide suggestions
+wirelint [workspace-dir]            # table: service, variable, where, problem, fix
+wirelint --json [workspace-dir]     # the same report as JSON
+wirelint --no-hints [workspace-dir] # hide suggestions
 ```
 
 Exit code `1` when there are failures, `0` when there are only suggestions,
@@ -139,16 +138,16 @@ a pull request:
 - uses: actions/checkout@v4
 - uses: actions/setup-node@v4
   with: { node-version: 22 }
-- run: npx wirecheck .
+- run: npx wirelint .
 ```
 
 ## Adopting it without fixing everything first
 
 ```bash
-wirecheck baseline [workspace-dir]
+wirelint baseline [workspace-dir]
 ```
 
-writes the current findings to `.wirecheck-baseline.json` (names and paths,
+writes the current findings to `.wirelint-baseline.json` (names and paths,
 no values). Commit it. From then on only new findings fail. Delete entries as
 you fix them.
 
@@ -156,12 +155,12 @@ To accept one variable permanently, say why in that service's `.env.example`.
 The reason is mandatory; a marker without one is itself a failure.
 
 ```bash
-CATALOG_URL=https://catalog.example.test/v1/items.xml  # wirecheck-ignore: third-party catalog, the full path is intended
+CATALOG_URL=https://catalog.example.test/v1/items.xml  # wirelint-ignore: third-party catalog, the full path is intended
 
-# wirecheck-ignore: vendor requires the trailing slash
+# wirelint-ignore: vendor requires the trailing slash
 VENDOR_URL=https://vendor.example.test/
 
-# wirecheck-ignore HARNESS_TOKEN: injected by the test harness, never configured by hand
+# wirelint-ignore HARNESS_TOKEN: injected by the test harness, never configured by hand
 ```
 
 ## Development

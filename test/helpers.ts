@@ -15,7 +15,7 @@ export const fixture = (name: string): string => path.join(path.dirname(fileURLT
 
 /** Build a throwaway workspace from a map of relative path -> file content. */
 export function workspace(files: Record<string, string>): string {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wirecheck-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wirelint-'));
   created.push(root);
   for (const [file, content] of Object.entries(files)) {
     const abs = path.join(root, file);

@@ -15,13 +15,13 @@ export interface IgnoreMarker {
 export interface ParsedEnv {
   entries: EnvEntry[];
   ignores: IgnoreMarker[];
-  /** `wirecheck-ignore` markers that carry no reason. They are not honoured. */
+  /** `wirelint-ignore` markers that carry no reason. They are not honoured. */
   badIgnores: { line: number; name?: string }[];
 }
 
 const VAR_RE = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*(.*)$/;
 const COMMENTED_VAR_RE = /^#\s*([A-Z][A-Z0-9_]*)=(.*)$/;
-const IGNORE_RE = /wirecheck-ignore\b[ \t]*([A-Za-z_][A-Za-z0-9_]*)?[ \t]*(?::[ \t]*(.*))?$/;
+const IGNORE_RE = /wirelint-ignore\b[ \t]*([A-Za-z_][A-Za-z0-9_]*)?[ \t]*(?::[ \t]*(.*))?$/;
 
 function splitValue(raw: string): { value: string; comment: string } {
   const t = raw.trim();
@@ -67,7 +67,7 @@ export function parseEnv(text: string): ParsedEnv {
       return;
     }
     if (t.startsWith('#')) {
-      if (t.includes('wirecheck-ignore')) {
+      if (t.includes('wirelint-ignore')) {
         marker(t, line);
         return;
       }
@@ -84,7 +84,7 @@ export function parseEnv(text: string): ParsedEnv {
       out.ignores.push({ name, reason: pending.reason, line: pending.line });
       pending = null;
     }
-    if (comment.includes('wirecheck-ignore')) marker(comment, line, name);
+    if (comment.includes('wirelint-ignore')) marker(comment, line, name);
   });
   return out;
 }

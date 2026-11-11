@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Finding } from './types.js';
 
-export const BASELINE_FILE = '.wirecheck-baseline.json';
+export const BASELINE_FILE = '.wirelint-baseline.json';
 
 interface BaselineDoc {
   version: 1;
@@ -10,7 +10,7 @@ interface BaselineDoc {
   findings: { fingerprint: string; check: string; service: string; variable: string; file: string }[];
 }
 
-/** Fingerprints accepted by an earlier `wirecheck baseline`, or an empty set. */
+/** Fingerprints accepted by an earlier `wirelint baseline`, or an empty set. */
 export function loadBaseline(workspace: string): Set<string> {
   try {
     const doc = JSON.parse(fs.readFileSync(path.join(workspace, BASELINE_FILE), 'utf8')) as BaselineDoc;
@@ -25,7 +25,7 @@ export function writeBaseline(workspace: string, findings: Finding[]): { file: s
   const kept = findings.filter((f) => f.severity !== 'info');
   const doc: BaselineDoc = {
     version: 1,
-    note: 'Findings accepted when wirecheck was adopted. Delete entries as you fix them; new findings still fail.',
+    note: 'Findings accepted when wirelint was adopted. Delete entries as you fix them; new findings still fail.',
     findings: kept.map((f) => ({ fingerprint: f.fingerprint, check: f.check, service: f.service, variable: f.variable, file: f.file })),
   };
   const file = path.join(workspace, BASELINE_FILE);

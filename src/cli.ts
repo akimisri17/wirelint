@@ -3,13 +3,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { BASELINE_FILE, loadBaseline, renderGithub, renderHuman, run, version, writeBaseline } from './index.js';
 
-const HELP = `wirecheck ${version()}
+const HELP = `wirelint ${version()}
 Catch cross-service environment-variable mistakes before deploy. Reads files only:
 no cloud credentials, no network, and it never prints a value from a non-example file.
 
 Usage
-  wirecheck [workspace-dir]            check a monorepo or a folder of sibling repos
-  wirecheck baseline [workspace-dir]   accept current findings into ${BASELINE_FILE}
+  wirelint [workspace-dir]            check a monorepo or a folder of sibling repos
+  wirelint baseline [workspace-dir]   accept current findings into ${BASELINE_FILE}
 
 Options
   --json          machine-readable report on stdout
@@ -20,7 +20,7 @@ Options
 
 Exit codes: 0 no failures (suggestions never fail), 1 failures, 2 usage error.
 Suppress one variable in a service's .env.example, reason required:
-  LEGACY_CATALOG_URL=https://catalog.example.test/v1/items.xml  # wirecheck-ignore: third-party catalog, full path is intended
+  LEGACY_CATALOG_URL=https://catalog.example.test/v1/items.xml  # wirelint-ignore: third-party catalog, full path is intended
 `;
 
 function main(argv: string[]): number {
@@ -29,7 +29,7 @@ function main(argv: string[]): number {
   const known = new Set(['--json', '--no-hints', '--no-baseline', '-h', '--help', '-v', '--version']);
   const unknown = [...flags].find((f) => !known.has(f));
   if (unknown) {
-    process.stderr.write(`wirecheck: unknown option ${unknown}\n\n${HELP}`);
+    process.stderr.write(`wirelint: unknown option ${unknown}\n\n${HELP}`);
     return 2;
   }
   if (flags.has('-h') || flags.has('--help')) {
@@ -43,24 +43,24 @@ function main(argv: string[]): number {
   const baselineMode = args[0] === 'baseline';
   if (baselineMode) args.shift();
   if (args.length > 1) {
-    process.stderr.write(`wirecheck: expected one workspace directory, got ${args.length}\n`);
+    process.stderr.write(`wirelint: expected one workspace directory, got ${args.length}\n`);
     return 2;
   }
   const workspace = path.resolve(args[0] ?? '.');
   if (!fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) {
-    process.stderr.write(`wirecheck: ${workspace} is not a directory\n`);
+    process.stderr.write(`wirelint: ${workspace} is not a directory\n`);
     return 2;
   }
 
   if (baselineMode) {
     const { file, count } = writeBaseline(workspace, run(workspace).findings);
-    process.stdout.write(`wirecheck: wrote ${count} finding${count === 1 ? '' : 's'} to ${file}\nCommit it. From now on only new findings fail.\n`);
+    process.stdout.write(`wirelint: wrote ${count} finding${count === 1 ? '' : 's'} to ${file}\nCommit it. From now on only new findings fail.\n`);
     return 0;
   }
 
   const report = run(workspace, flags.has('--no-baseline') ? new Set() : loadBaseline(workspace));
   if (report.services.length === 0) {
-    process.stderr.write(`wirecheck: no services found under ${workspace} (looked for child directories with a package.json or a .git)\n`);
+    process.stderr.write(`wirelint: no services found under ${workspace} (looked for child directories with a package.json or a .git)\n`);
     return 2;
   }
   if (flags.has('--json')) {

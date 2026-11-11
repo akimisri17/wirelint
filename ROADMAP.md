@@ -10,9 +10,9 @@ contract file. The annotation sits next to the variable it describes, in the
 repo that owns it.
 
 ```bash
-JWT_SECRET=           # wirecheck: same-as identity-api
-SENTRY_DSN=           # wirecheck: optional
-NEXT_PUBLIC_API_URL=  # wirecheck: build-time
+JWT_SECRET=           # wirelint: same-as identity-api
+SENTRY_DSN=           # wirelint: optional
+NEXT_PUBLIC_API_URL=  # wirelint: build-time
 ```
 
 | Annotation | Effect |

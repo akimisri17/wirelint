@@ -41,7 +41,7 @@ describe('cli', () => {
 
   it('adds GitHub annotations when GITHUB_ACTIONS is set', () => {
     const r = cli([fixture('shop')], { GITHUB_ACTIONS: 'true', GITHUB_WORKSPACE: fixture('shop') });
-    expect(r.out).toContain('::error file=storefront/.env.example,line=4,title=wirecheck url-shape%3A NEXT_PUBLIC_SITE_URL::');
+    expect(r.out).toContain('::error file=storefront/.env.example,line=4,title=wirelint url-shape%3A NEXT_PUBLIC_SITE_URL::');
     expect(r.out).toContain('::notice ');
   });
 
@@ -51,7 +51,7 @@ describe('cli', () => {
 
     const b = cli(['baseline', ws]);
     expect(b.code).toBe(0);
-    const file = path.join(ws, '.wirecheck-baseline.json');
+    const file = path.join(ws, '.wirelint-baseline.json');
     const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
     expect(doc.findings.map((f: { variable: string }) => f.variable).sort()).toEqual(['API_URL', 'MISSING_KEY']);
     expect(fs.readFileSync(file, 'utf8')).not.toContain('a.example.test');
@@ -72,6 +72,6 @@ describe('cli', () => {
     expect(cli(['--nope']).code).toBe(2);
     expect(cli(['/definitely/not/a/dir']).code).toBe(2);
     expect(cli([workspace({ 'README.md': 'nothing here' })]).code).toBe(2);
-    expect(cli(['--help']).out).toContain('wirecheck baseline');
+    expect(cli(['--help']).out).toContain('wirelint baseline');
   });
 });

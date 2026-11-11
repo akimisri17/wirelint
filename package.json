@@ -1,12 +1,12 @@
 {
-  "name": "wirecheck",
+  "name": "wirelint",
   "version": "0.0.1",
   "private": true,
   "description": "Zero-config CLI that catches cross-service environment-variable mistakes before deploy.",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "wirecheck": "dist/cli.js"
+    "wirelint": "dist/cli.js"
   },
   "files": [
     "dist",

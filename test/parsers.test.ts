@@ -21,7 +21,7 @@ describe('env file parser', () => {
 
   it('attaches ignore markers inline, from the line above, or by name', () => {
     const { ignores, badIgnores } = parseEnv(
-      ['A=1 # wirecheck-ignore: inline reason', '# wirecheck-ignore: reason above', 'B=2', '# wirecheck-ignore C: named reason', 'D=4 # wirecheck-ignore', '# wirecheck-ignore:'].join('\n'),
+      ['A=1 # wirelint-ignore: inline reason', '# wirelint-ignore: reason above', 'B=2', '# wirelint-ignore C: named reason', 'D=4 # wirelint-ignore', '# wirelint-ignore:'].join('\n'),
     );
     expect(ignores.map((i) => [i.name, i.reason])).toEqual([
       ['A', 'inline reason'],

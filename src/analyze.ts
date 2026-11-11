@@ -175,8 +175,8 @@ export function analyze(workspaceArg: string): Analysis {
         variable: bad.name ?? '(marker)',
         file: bad.file,
         line: bad.line,
-        problem: 'wirecheck-ignore marker has no reason, so it is not honoured',
-        fix: 'write "# wirecheck-ignore: <why this is safe to ignore>"',
+        problem: 'wirelint-ignore marker has no reason, so it is not honoured',
+        fix: 'write "# wirelint-ignore: <why this is safe to ignore>"',
       });
     }
 

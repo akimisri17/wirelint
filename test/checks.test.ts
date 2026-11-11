@@ -338,10 +338,10 @@ describe('noise control', () => {
     const r = service({
       'src/a.ts': 'process.env.NOT_LISTED_KEY;',
       '.env.example': [
-        'CATALOG_URL=https://catalog.example.test/v1/items.xml # wirecheck-ignore: third-party catalog, full path intended',
-        '# wirecheck-ignore: vendor requires the trailing slash',
+        'CATALOG_URL=https://catalog.example.test/v1/items.xml # wirelint-ignore: third-party catalog, full path intended',
+        '# wirelint-ignore: vendor requires the trailing slash',
         'VENDOR_URL=https://vendor.example.test/',
-        '# wirecheck-ignore NOT_LISTED_KEY: injected by the test harness only',
+        '# wirelint-ignore NOT_LISTED_KEY: injected by the test harness only',
       ].join('\n'),
     });
     expect(r.findings).toEqual([]);
@@ -349,7 +349,7 @@ describe('noise control', () => {
   });
 
   it('refuses a suppression without a reason and still reports the finding', () => {
-    const r = service({ '.env.example': 'CATALOG_URL=https://catalog.example.test/v1/items.xml # wirecheck-ignore\n' });
+    const r = service({ '.env.example': 'CATALOG_URL=https://catalog.example.test/v1/items.xml # wirelint-ignore\n' });
     expect(r.findings.map((f) => f.check).sort()).toEqual(['suppression-without-reason', 'url-shape']);
     expect(find(r, 'suppression-without-reason')[0]).toMatchObject({ severity: 'error', variable: 'CATALOG_URL', line: 1 });
   });
@@ -358,7 +358,7 @@ describe('noise control', () => {
     const r = run(
       workspace({
         'a/package.json': pkg('a'),
-        'a/.env.example': 'X_URL=https://x.example.test/ # wirecheck-ignore: intended here\n',
+        'a/.env.example': 'X_URL=https://x.example.test/ # wirelint-ignore: intended here\n',
         'b/package.json': pkg('b'),
         'b/.env.example': 'X_URL=https://x.example.test/\n',
       }),
