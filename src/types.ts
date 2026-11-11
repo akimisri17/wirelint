@@ -229,6 +229,8 @@ export interface PrRepo {
   base?: string;
   /** Why the repository was skipped, when it was. */
   skipped?: string;
+  /** How to make it checkable, when it was skipped. */
+  fix?: string;
 }
 
 /** A variable the diff adds, and where it is not yet set. */
@@ -242,7 +244,8 @@ export interface PrVariable {
   /**
    * Deploy targets (or, for build-time variables, build configurations) that
    * do not set it yet, with the environments concerned. `envs` is empty when
-   * the target has no per-environment config.
+   * the target has no per-environment config. Always empty for an optional
+   * variable; an environment that sets a fallback-chain sibling is not listed.
    */
   missing: { target: string; kind: string; envs: string[] }[];
   /** No deploy target (or build configuration) for the service is visible in the checkout. */
@@ -252,4 +255,8 @@ export interface PrVariable {
 export interface PrSummary {
   repos: PrRepo[];
   variables: PrVariable[];
+  /** False when any repository was skipped: the result covers only part of the change. */
+  complete: boolean;
+  /** Repositories actually diffed. Zero means nothing was checked. */
+  checked: number;
 }

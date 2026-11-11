@@ -14,11 +14,14 @@ export interface PrOptions {
   env?: NodeJS.ProcessEnv;
 }
 
-function git(cwd: string, args: string[]): { ok: boolean; out: string; err: string } {
+function git(cwd: string, args: string[]): { ok: boolean; out: string; err: string; missing?: boolean } {
   const r = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
-  if (r.error) return { ok: false, out: '', err: r.error.message };
+  if (r.error) return { ok: false, out: '', err: r.error.message, missing: (r.error as NodeJS.ErrnoException).code === 'ENOENT' };
   return { ok: r.status === 0, out: r.stdout ?? '', err: (r.stderr ?? '').trim() };
 }
+
+const FETCH_BASE = 'fetch the base branch (actions/checkout with fetch-depth: 0) or pass --base <ref>';
+const FETCH_HISTORY = 'fetch full history (actions/checkout with fetch-depth: 0) so base...HEAD has a merge base';
 
 const real = (p: string): string => {
   try {
@@ -28,9 +31,40 @@ const real = (p: string): string => {
   }
 };
 
-function repoRoot(dir: string): string | null {
+/** The repository root, or why there is none, with the fix. */
+function repoRoot(dir: string): { root: string } | { reason: string; fix: string } {
   const r = git(dir, ['rev-parse', '--show-toplevel']);
-  return r.ok && r.out.trim() ? real(r.out.trim()) : null;
+  if (r.ok && r.out.trim()) return { root: real(r.out.trim()) };
+  if (r.missing) return { reason: 'git is not installed or not on PATH', fix: 'install git and make sure it is on PATH' };
+  const first = r.err.split('\n').find((l) => l.trim()) ?? '';
+  if (/not a git repository/i.test(first)) return { reason: 'not inside a git repository', fix: 'run PR mode in a git checkout of this service' };
+  if (/dubious ownership/i.test(r.err)) return { reason: `git refused the repository: ${first}`, fix: `mark it safe with git config --global --add safe.directory <repo path>, then rerun` };
+  return { reason: `git rev-parse failed: ${first || `exit ${r.ok ? 0 : 'non-zero'}`}`, fix: 'resolve the git error, then rerun' };
+}
+
+/** Undo git's C-style quoting of a path ("a\\"b", octal escapes for raw bytes). */
+export function unquotePath(raw: string): string {
+  if (!raw.startsWith('"') || !raw.endsWith('"') || raw.length < 2) return raw;
+  const body = raw.slice(1, -1);
+  const bytes: number[] = [];
+  const simple: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92 };
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i]!;
+    if (c !== '\\') {
+      bytes.push(...Buffer.from(c, 'utf8'));
+      continue;
+    }
+    const n = body[i + 1] ?? '';
+    const oct = /^[0-7]{3}/.exec(body.slice(i + 1));
+    if (oct) {
+      bytes.push(parseInt(oct[0], 8));
+      i += 3;
+    } else {
+      bytes.push(simple[n] ?? n.charCodeAt(0));
+      i++;
+    }
+  }
+  return Buffer.from(bytes).toString('utf8');
 }
 
 export function baseCandidates(explicit: string | undefined, env: NodeJS.ProcessEnv): string[] {
@@ -52,7 +86,11 @@ export function parseDiff(root: string, text: string): Diff {
   let oldFile: string | null = null;
   let newFile: string | null = null;
   let line = 0;
-  const strip = (p: string) => (p === '/dev/null' ? null : path.join(root, p.replace(/^"|"$/g, '').replace(/^[ab]\//, '')));
+  // A name with a space gets a trailing tab; a name with " or \\ is C-quoted.
+  const strip = (raw: string) => {
+    const p = unquotePath(raw.replace(/\t$/, ''));
+    return p === '/dev/null' ? null : path.join(root, p.replace(/^[ab]\//, ''));
+  };
   for (const l of text.split('\n')) {
     if (l.startsWith('diff --git ')) {
       header = true;
@@ -110,26 +148,29 @@ export function scanPr(a: Analysis, opts: PrOptions = {}): PrScan {
   const env = opts.env ?? process.env;
   const ws = real(a.workspace);
   const byRoot = new Map<string, Service[]>();
-  const outside: Service[] = [];
+  const outside = new Map<string, { fix: string; services: Service[] }>();
   for (const svc of a.services) {
-    const root = repoRoot(svc.dir);
-    if (!root) outside.push(svc);
-    else {
-      if (!byRoot.has(root)) byRoot.set(root, []);
-      byRoot.get(root)!.push(svc);
+    const found = repoRoot(svc.dir);
+    if ('reason' in found) {
+      if (!outside.has(found.reason)) outside.set(found.reason, { fix: found.fix, services: [] });
+      outside.get(found.reason)!.services.push(svc);
+    } else {
+      if (!byRoot.has(found.root)) byRoot.set(found.root, []);
+      byRoot.get(found.root)!.push(svc);
     }
   }
 
   const repos: PrRepo[] = [];
   const diffs = new Map<Service, Diff>();
-  if (outside.length) repos.push({ root: '-', services: outside.map((s) => s.name), skipped: 'not inside a git repository' });
+  for (const [reason, o] of outside) repos.push({ root: '-', services: o.services.map((s) => s.name), skipped: reason, fix: o.fix });
   for (const [root, svcs] of [...byRoot].sort((x, y) => x[0].localeCompare(y[0]))) {
     const repo: PrRepo = { root: rel(ws, root), services: svcs.map((s) => s.name) };
     repos.push(repo);
     const tried = baseCandidates(opts.base, env);
     const base = tried.find((ref) => git(root, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).ok);
     if (!base) {
-      repo.skipped = `no base ref resolves (tried ${tried.join(', ')}); fetch it or pass --base <ref>`;
+      repo.skipped = `no base ref resolves (tried ${tried.join(', ')})`;
+      repo.fix = FETCH_BASE;
       continue;
     }
     repo.base = base;
@@ -139,6 +180,7 @@ export function scanPr(a: Analysis, opts: PrOptions = {}): PrScan {
     ]);
     if (!d.ok) {
       repo.skipped = `git diff ${base}...HEAD failed: ${d.err.split('\n')[0] || 'unknown error'}`;
+      repo.fix = /merge base/i.test(d.err) ? FETCH_HISTORY : d.missing ? 'install git and make sure it is on PATH' : FETCH_HISTORY;
       delete repo.base;
       continue;
     }
@@ -176,15 +218,19 @@ export function scanPr(a: Analysis, opts: PrOptions = {}): PrScan {
       addedBy.get(svc.name)!.add(name);
       const kinds = [...(ann.get(name) ?? [])].sort();
       const v: PrVariable = { service: svc.name, variable: name, added: at, annotations: kinds, missing: [], noTargets: false };
-      if (kinds.includes('build-time')) {
+      // Members of a fallback chain stand in for each other.
+      const siblings = svc.chains.filter((c) => c.names.includes(name)).flatMap((c) => c.names.filter((n) => n !== name));
+      if (kinds.includes('optional')) {
+        // Optional: no deploy target needs it, so nothing is "not yet set".
+      } else if (kinds.includes('build-time')) {
         v.noTargets = svc.build.length === 0;
         if (!svc.build.some((b) => b.names.has(name))) v.missing = svc.build.map((b) => ({ target: b.file, kind: b.kind, envs: [] }));
       } else {
         v.noTargets = targets.length === 0;
-        if (!svc.baked.has(name)) {
+        if (!svc.baked.has(name) && !siblings.some((n) => svc.baked.has(n))) {
           for (const t of targets) {
             if (isProvidedByTarget(t.kind, name)) continue;
-            const envs = t.envs.filter((e) => !e.opaque && !e.vars.has(name)).map((e) => e.name);
+            const envs = t.envs.filter((e) => !e.opaque && !e.vars.has(name) && !siblings.some((n) => e.vars.has(n))).map((e) => e.name);
             if (envs.length) v.missing.push({ target: t.file, kind: t.kind, envs: envs.filter((e) => e !== '*') });
           }
         }
@@ -200,5 +246,6 @@ export function scanPr(a: Analysis, opts: PrOptions = {}): PrScan {
     const names = f.variable.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? [];
     return services.some((s) => names.some((n) => addedBy.get(s)?.has(n)));
   };
-  return { summary: { repos, variables }, keep };
+  const checked = repos.filter((r) => !r.skipped).length;
+  return { summary: { repos, variables, complete: checked === repos.length, checked }, keep };
 }

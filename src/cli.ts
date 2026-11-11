@@ -118,18 +118,37 @@ function main(argv: string[]): number {
       if (annotations) process.stdout.write(annotations + '\n');
     }
   }
-  if (prMode) {
-    const body = renderMarkdown(report);
-    const commentFile = values.get('--comment-file');
+  const code = report.summary.failures > 0 ? 1 : 0;
+  if (!prMode) return code;
+
+  // The findings' exit code wins when it is 1. A failed explicit --comment-file
+  // is a usage error otherwise; a failed step summary is only a warning.
+  let result = code;
+  const body = renderMarkdown(report);
+  const commentFile = values.get('--comment-file');
+  if (commentFile) {
     try {
-      if (commentFile) fs.writeFileSync(path.resolve(commentFile), body);
-      if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, body + '\n');
+      fs.writeFileSync(path.resolve(commentFile), body);
     } catch (e) {
-      process.stderr.write(`wirelint: could not write the PR comment: ${(e as Error).message}\n`);
-      return 2;
+      process.stderr.write(`wirelint: could not write --comment-file ${commentFile}: ${(e as Error).message}\n`);
+      if (result === 0) result = 2;
     }
   }
-  return report.summary.failures > 0 ? 1 : 0;
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    try {
+      fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, body + '\n');
+    } catch (e) {
+      process.stderr.write(`wirelint: warning: could not append to $GITHUB_STEP_SUMMARY: ${(e as Error).message}\n`);
+    }
+  }
+  const pr = report.pr!;
+  if (pr.checked === 0) {
+    const first = pr.repos[0];
+    process.stderr.write(`wirelint: PR mode checked nothing: every repository was skipped${first ? ` (${first.skipped}; fix: ${first.fix})` : ''}\n`);
+    return 2;
+  }
+  if (!pr.complete) process.stderr.write(`wirelint: warning: PR mode skipped ${pr.repos.length - pr.checked} of ${pr.repos.length} repositories; the result is incomplete\n`);
+  return result;
 }
 
 process.exitCode = main(process.argv.slice(2));

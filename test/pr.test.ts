@@ -3,8 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { renderMarkdown, runPr } from '../src/index.js';
-import { baseCandidates } from '../src/pr.js';
+import { renderHuman, renderMarkdown, runPr } from '../src/index.js';
+import type { Report } from '../src/index.js';
+import { baseCandidates, parseDiff, unquotePath } from '../src/pr.js';
 import { pkg, workspace } from './helpers.js';
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'cli.js');
@@ -136,10 +137,13 @@ describe('PR mode', () => {
     initRepo(path.join(ws, 'a'), 'trunk');
     const r = runPr(ws, new Set(), { env: {} });
     expect(r.pr!.repos).toEqual([
-      { root: '-', services: ['b'], skipped: 'not inside a git repository' },
-      { root: 'a', services: ['a'], skipped: 'no base ref resolves (tried origin/main, main); fetch it or pass --base <ref>' },
+      { root: '-', services: ['b'], skipped: 'not inside a git repository', fix: 'run PR mode in a git checkout of this service' },
+      { root: 'a', services: ['a'], skipped: 'no base ref resolves (tried origin/main, main)', fix: 'fetch the base branch (actions/checkout with fetch-depth: 0) or pass --base <ref>' },
     ]);
+    expect(r.pr).toMatchObject({ complete: false, checked: 0 });
     expect(r.findings).toEqual([]);
+    expect(renderHuman(r)).toContain('NOTHING WAS CHECKED: every repository was skipped');
+    expect(renderMarkdown(r)).toContain('### wirelint: nothing was checked');
     expect(runPr(ws, new Set(), { base: 'trunk' }).pr!.repos[1]).toEqual({ root: 'a', services: ['a'], base: 'trunk' });
   });
 
@@ -165,9 +169,83 @@ describe('PR mode', () => {
     commit(path.join(ws, 'orders'), { 'src/p.ts': "cfg.getOrThrow('PAYOUT_SIGNING_KEY');\n", 'copilot/orders/manifest.yml': ordersManifest.replace('  dev:\n', '  dev:\n    secrets:\n      PAYOUT_SIGNING_KEY: /orders/dev/PAYOUT_REF\n') });
     const md = renderMarkdown(runPr(ws, new Set(), { base: 'main' }));
     expect(md).toContain('### wirelint: 1 new variable in this change');
-    expect(md).toContain('| orders | `PAYOUT_SIGNING_KEY` | `orders/src/p.ts:1` | not yet set in: `orders/copilot/orders/manifest.yml` (prod) |');
+    expect(md).toContain('| `orders` | `PAYOUT_SIGNING_KEY` | `orders/src/p.ts:1` | not yet set in: `orders/copilot/orders/manifest.yml` (`prod`) |');
     expect(md).toContain('#### Failures (2)');
     expect(md).not.toMatch(/PAYOUT_REF|JWT_SECRET_REF/);
+  });
+});
+
+describe('PR mode regressions', () => {
+  it('finds added lines in paths with a space, a quote or a backslash', () => {
+    expect(unquotePath('"b/src/quo\\"te.ts"')).toBe('b/src/quo"te.ts');
+    expect(unquotePath('"b/caf\\303\\251/back\\\\slash.ts"')).toBe('b/café/back\\slash.ts');
+    const d = parseDiff('/r', 'diff --git a/x y.ts b/x y.ts\n--- a/x y.ts\t\n+++ b/x y.ts\t\n@@ -0,0 +1 @@\n+process.env.A_KEY;\n');
+    expect([...d.added.keys()]).toEqual([path.join('/r', 'x y.ts')]);
+
+    const ws = siblings();
+    commit(path.join(ws, 'orders'), {
+      'src/new file.ts': "cfg.getOrThrow('SPACED_KEY');\n",
+      'src/quo"te.ts': "cfg.getOrThrow('QUOTED_KEY');\n",
+      'src/back\\slash.ts': "cfg.getOrThrow('BACKSLASH_KEY');\n",
+    });
+    expect(runPr(ws, new Set(), { base: 'main' }).pr!.variables.map((v) => v.variable)).toEqual(['BACKSLASH_KEY', 'QUOTED_KEY', 'SPACED_KEY']);
+  });
+
+  it('says the result is incomplete when one repo was skipped', () => {
+    const ws = siblings();
+    git(path.join(ws, 'web'), 'branch', '-q', '-m', 'main', 'trunk');
+    commit(path.join(ws, 'orders'), { 'src/p.ts': "cfg.getOrThrow('PAYOUT_SIGNING_KEY');\n" });
+    const r = runPr(ws, new Set(), { env: {} });
+    expect(r.pr).toMatchObject({ complete: false, checked: 1 });
+    expect(renderHuman(r)).toContain('NOT FULLY CHECKED: 1 of 2 repositories skipped');
+    expect(renderHuman(r)).toContain('fix: fetch the base branch (actions/checkout with fetch-depth: 0) or pass --base <ref>');
+    const md = renderMarkdown(r);
+    expect(md).toContain('### wirelint: not fully checked; 1 new variable in the part that was checked');
+    expect(md).toContain('> **Not checked:** repo `web`: no base ref resolves');
+  });
+
+  it('names git missing and passes on git\'s own reason for other failures', () => {
+    const ws = workspace({ 'a/package.json': pkg('a'), 'a/.git': 'garbage, not a gitdir line\n', 'b/package.json': pkg('b') });
+    const reasons = runPr(ws, new Set(), { base: 'main' }).pr!.repos.map((r) => r.skipped!);
+    expect(reasons.some((x) => /^git rev-parse failed: fatal: invalid gitfile format/.test(x))).toBe(true);
+    const saved = process.env.PATH;
+    process.env.PATH = path.join(ws, 'no-such-bin');
+    try {
+      expect(runPr(ws, new Set(), { base: 'main' }).pr!.repos).toEqual([
+        { root: '-', services: ['a', 'b'], skipped: 'git is not installed or not on PATH', fix: 'install git and make sure it is on PATH' },
+      ]);
+    } finally {
+      process.env.PATH = saved;
+    }
+  });
+
+  it('lists nothing for an optional variable, and lets a chain sibling stand in', () => {
+    const ws = siblings();
+    commit(path.join(ws, 'orders'), {
+      'copilot/orders/manifest.yml': ordersManifest.replace('  prod:\n', '  prod:\n    variables:\n      SEARCH_API_URL: https://search.example.test\n'),
+      'src/search.ts': "export const s = process.env.SEARCH_URL ?? process.env.SEARCH_API_URL ?? 'http://localhost:4010';\nexport const t = process.env.TRACE_TOKEN;\n",
+      '.env.example': 'JWT_SECRET=dev-orders\nBILLING_URL=http://localhost:4002\nTRACE_TOKEN=  # wirelint: optional -- local tracing only\n',
+    });
+    const vars = Object.fromEntries(runPr(ws, new Set(), { base: 'main' }).pr!.variables.map((v) => [v.variable, v.missing.map((m) => m.envs)]));
+    expect(vars).toEqual({ SEARCH_URL: [['dev']], SEARCH_API_URL: [['dev']], TRACE_TOKEN: [] });
+  });
+
+  it('escapes Markdown, HTML and mentions in text that comes from repo files', () => {
+    const report = {
+      version: '0.2.0', workspace: '/w', services: [], edges: [], annotations: [], relations: [],
+      findings: [{ fingerprint: 'f', check: 'url-shape', severity: 'error', service: '@admins', variable: 'A_URL', file: 'svc/we`ird|<b>.env.example', line: 1, problem: 'value "<img src=x onerror=1>" mentions @org/team and **bold**', fix: 'set A_URL=https://a.example.test' }],
+      pr: { repos: [{ root: '@ops', services: ['@admins'], skipped: 'git said <script>' , fix: 'ping @ops' }], variables: [{ service: '@admins', variable: 'A_URL', added: [{ file: 'a`b|c.ts', line: 2 }], annotations: [], missing: [], noTargets: true }], complete: false, checked: 0 },
+      summary: { failures: 1, suggestions: 0, notes: 0, baselined: 0, suppressed: 0, durationMs: 1 },
+    } as Report;
+    const md = renderMarkdown(report);
+    // Outside code spans, nothing from the repo may render as HTML, Markdown or a mention.
+    const prose = md.replace(/`` .*? ``|`[^`]*`/g, '');
+    expect(prose).not.toMatch(/<img|<script>|<b>|\*\*bold\*\*/);
+    expect(prose).not.toMatch(/@(admins|org|ops)\b/);
+    expect(md).toContain('&lt;img src=x onerror=1&gt;');
+    expect(md).toContain('@\u200borg/team');
+    expect(md).toContain('| `@admins` | `A_URL` | `` a`b\\|c.ts:2 `` |');
+    expect(md).toContain('`` svc/we`ird|<b>.env.example:1 ``');
   });
 });
 
@@ -189,6 +267,25 @@ describe('PR mode CLI', () => {
 
     const json = JSON.parse(cli(['--pr', '--base=main', '--json', ws]).out);
     expect(json.pr.variables.map((v: { variable: string }) => v.variable)).toEqual(['PAYOUT_SIGNING_KEY']);
+  });
+
+  it('keeps exit 1 over a failed comment write, warns only for the step summary, and exits 2 when nothing was checked', () => {
+    const ws = siblings();
+    const dir = path.join(ws, 'a-directory');
+    fs.mkdirSync(dir);
+    const clean = cli(['--pr', '--base', 'main', '--comment-file', dir, ws], { GITHUB_STEP_SUMMARY: dir });
+    expect(clean.code).toBe(2);
+    expect(clean.err).toContain('could not write --comment-file');
+    expect(clean.err).toContain('warning: could not append to $GITHUB_STEP_SUMMARY');
+    expect(cli(['--pr', '--base', 'main', ws], { GITHUB_STEP_SUMMARY: dir }).code).toBe(0);
+
+    commit(path.join(ws, 'orders'), { 'src/p.ts': "cfg.getOrThrow('PAYOUT_SIGNING_KEY');\n" });
+    expect(cli(['--pr', '--base', 'main', '--comment-file', dir, ws], { GITHUB_STEP_SUMMARY: dir }).code).toBe(1);
+
+    const none = cli(['--pr', '--base', 'no-such-ref', ws]);
+    expect(none.code).toBe(2);
+    expect(none.out).toContain('NOTHING WAS CHECKED');
+    expect(none.err).toContain('PR mode checked nothing');
   });
 
   it('exits 0 when the diff adds nothing, and 2 on bad usage', () => {

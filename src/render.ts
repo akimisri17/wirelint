@@ -1,5 +1,5 @@
 import path from 'node:path';
-import type { Finding, PrVariable, Report } from './types.js';
+import type { Finding, PrRepo, PrVariable, Report } from './types.js';
 
 function wrap(text: string, width: number): string[] {
   const lines: string[] = [];
@@ -54,12 +54,16 @@ export function renderHuman(report: Report, opts: { width?: number; hints?: bool
   const notes = report.findings.filter((f) => f.severity === 'info');
   if (report.pr) {
     const { repos, variables } = report.pr;
-    for (const r of repos) {
-      out.push(r.skipped ? `  skipped ${r.root === '-' ? r.services.join(', ') : `repo ${r.root}`}: ${r.skipped}` : `  diffed repo ${r.root} against ${r.base}`);
+    for (const r of repos) if (!r.skipped) out.push(`  diffed repo ${r.root} against ${r.base}`);
+    const skipped = repos.filter((r) => r.skipped);
+    if (skipped.length) {
+      out.push('', report.pr.checked === 0 ? 'NOTHING WAS CHECKED: every repository was skipped' : `NOT FULLY CHECKED: ${skipped.length} of ${repos.length} repositories skipped`);
+      for (const r of skipped) out.push(`  ${skipLabel(r)}: ${r.skipped}`, `    fix: ${r.fix}`);
     }
-    out.push('', variables.length ? `NEW IN THIS DIFF (${variables.length})` : 'NEW IN THIS DIFF: no new variables');
+    out.push('', variables.length ? `NEW IN THIS DIFF (${variables.length})` : `NEW IN THIS DIFF: no new variables${skipped.length ? ' in what was checked' : ''}`);
     for (const v of variables) out.push(`  ${v.service}  ${v.variable}  added in ${where(v)}`, `    ${notYetSet(v)}`);
   }
+
   if (errors.length) out.push('', `FAILURES (${errors.length})`, table(errors, width));
   if (hints.length && opts.hints !== false) out.push('', `SUGGESTIONS (${hints.length}) - these never fail the run`, table(hints, width));
   if (report.edges.length) {
@@ -89,17 +93,49 @@ function where(v: PrVariable): string {
   return `${first.file}:${first.line}${v.added.length > 1 ? ` (+${v.added.length - 1} more)` : ''}`;
 }
 
+const skipLabel = (r: PrRepo, code: (s: string) => string = (x) => x): string =>
+  r.root === '-' ? r.services.map(code).join(', ') : `repo ${code(r.root)}`;
+
 /** Where a new variable is not yet set, in one sentence. */
 function notYetSet(v: PrVariable, code: (s: string) => string = (s) => s): string {
-  const tag = v.annotations.length ? ` (${v.annotations.join(', ')})` : '';
+  const tag = v.annotations.length ? ` (${v.annotations.map(code).join(', ')})` : '';
   const build = v.annotations.includes('build-time');
+  if (v.annotations.includes('optional')) return `optional, so no deploy target needs it${tag}`;
   if (v.noTargets) return `${build ? 'no build configuration' : 'no deploy target'} is visible in the checkout; set it wherever ${build ? 'the build runs' : 'it is deployed'}${tag}`;
   if (v.missing.length === 0) return `set in every ${build ? 'build configuration' : 'deploy target and environment'} visible in the checkout${tag}`;
-  const parts = v.missing.map((m) => code(m.target) + (m.envs.length ? ` (${m.envs.join(', ')})` : ''));
+  const parts = v.missing.map((m) => code(m.target) + (m.envs.length ? ` (${m.envs.map(code).join(', ')})` : ''));
   return `not yet set in: ${parts.join('; ')}${tag}`;
 }
 
-const mdCell = (s: string) => s.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+/**
+ * Text from repo files (names, paths, annotation words) goes in a code span:
+ * nothing inside renders as Markdown or HTML, and an @ there mentions nobody.
+ * The fence is longer than any backtick run in the text.
+ */
+export function mdCode(s: string): string {
+  const longest = Math.max(0, ...(s.match(/`+/g) ?? []).map((r) => r.length));
+  const fence = '`'.repeat(longest + 1);
+  const pad = longest > 0 || s.startsWith(' ') || s.endsWith(' ') ? ' ' : '';
+  return `${fence}${pad}${s.replace(/\r?\n/g, ' ')}${pad}${fence}`;
+}
+
+/**
+ * Prose that embeds repo-derived text (problems, fixes, git messages): HTML
+ * is entity-encoded, Markdown punctuation is backslash-escaped, and every @
+ * is followed by a zero-width space so it cannot mention a user or team.
+ */
+export function mdText(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/[\\`*_{}[\]()#+!|~]/g, '\\$&')
+    .replace(/@/g, '@\u200b')
+    .replace(/\r?\n/g, ' ');
+}
+
+/** A table cell: a literal | must be escaped even inside a code span. */
+const mdCell = (s: string) => s.replace(/\|/g, '\\|');
 
 /**
  * A pull-request comment body. wirelint never posts it; a CI step does.
@@ -110,28 +146,36 @@ export function renderMarkdown(report: Report): string {
   const out: string[] = ['<!-- wirelint -->'];
   const vars = report.pr?.variables ?? [];
   const { summary: s } = report;
-  out.push(`### wirelint: ${vars.length} new variable${vars.length === 1 ? '' : 's'} in this change`, '');
+  const plural = `${vars.length} new variable${vars.length === 1 ? '' : 's'}`;
+  const skipped = (report.pr?.repos ?? []).filter((r) => r.skipped);
+  const headline =
+    report.pr && report.pr.checked === 0 ? 'nothing was checked'
+    : skipped.length ? `not fully checked; ${plural} in the part that was checked`
+    : `${plural} in this change`;
+  out.push(`### wirelint: ${headline}`, '');
+  if (skipped.length) {
+    for (const r of skipped) out.push(`> **Not checked:** ${skipLabel(r, mdCode)}: ${mdText(r.skipped!)}. **Fix:** ${mdText(r.fix ?? '')}`, '>');
+    out.pop();
+    out.push('');
+  }
   if (vars.length) {
     out.push('| Service | Variable | Added in | Where it is not set yet |', '| --- | --- | --- | --- |');
-    for (const v of vars) out.push(`| ${mdCell(v.service)} | \`${v.variable}\` | \`${mdCell(where(v))}\` | ${mdCell(notYetSet(v, (t) => `\`${t}\``))} |`);
+    for (const v of vars) out.push(`| ${[mdCode(v.service), mdCode(v.variable), mdCode(where(v)), notYetSet(v, mdCode)].map(mdCell).join(' | ')} |`);
     out.push('');
-  } else {
+  } else if (!skipped.length) {
     out.push('This change adds no environment variables.', '');
   }
   const section = (title: string, list: Finding[]) => {
     if (!list.length) return;
     out.push(`#### ${title} (${list.length})`, '');
     for (const f of list) {
-      const loc = f.file ? ` \`${f.line ? `${f.file}:${f.line}` : f.file}\`` : '';
-      out.push(`- **${f.service}** \`${f.variable}\`${loc}: ${f.problem}. **Fix:** ${f.fix}`);
+      const loc = f.file ? ` ${mdCode(f.line ? `${f.file}:${f.line}` : f.file)}` : '';
+      out.push(`- ${mdCode(f.service)} ${mdCode(f.variable)}${loc}: ${mdText(f.problem)}. **Fix:** ${mdText(f.fix)}`);
     }
     out.push('');
   };
   section('Failures', report.findings.filter((f) => f.severity === 'error'));
   section('Suggestions, never fail the run', report.findings.filter((f) => f.severity === 'hint'));
-  const skipped = (report.pr?.repos ?? []).filter((r) => r.skipped);
-  for (const r of skipped) out.push(`> Skipped ${r.root === '-' ? r.services.join(', ') : `\`${r.root}\``}: ${r.skipped}`);
-  if (skipped.length) out.push('');
   out.push(`${s.failures} failure${s.failures === 1 ? '' : 's'}, ${s.suggestions} suggestion${s.suggestions === 1 ? '' : 's'}. wirelint ${report.version}, files only, no values from deployed config.`);
   return out.join('\n') + '\n';
 }
