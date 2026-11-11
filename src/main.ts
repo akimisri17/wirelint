@@ -27,10 +27,14 @@ Options
   -v, --version          show the version
 
 Live checks: opt-in, read-only (list/describe/get calls only; nothing is written)
-  --live ssm             check that the SSM parameters Copilot manifests reference exist
-                         AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY [, AWS_SESSION_TOKEN] from the environment
+  --live <adapters>      ssm, vercel or ssm,vercel: check that what deploy config relies on exists
+                         ssm: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY [, AWS_SESSION_TOKEN] from the environment
+                         vercel: VERCEL_TOKEN from the environment
   --env <name>           ssm: only this Copilot environment (repeatable, or comma-separated)
   --region <region>      ssm: region (default $AWS_REGION, else $AWS_DEFAULT_REGION)
+  --vercel-project <service>=<projectId>
+                         vercel: project for a service without .vercel/project.json (repeatable)
+  --vercel-team <teamId> vercel: team (default .vercel/project.json orgId, else $VERCEL_TEAM_ID)
 
 Exit codes: 0 no failures (suggestions never fail), 1 failures, 2 usage error,
 or a requested live check that could not run (failures still exit 1).
@@ -49,10 +53,10 @@ interface Parsed {
 }
 
 const PR_OPTIONS = ['--base', '--comment-file'];
-const VALUE_OPTIONS = new Set([...PR_OPTIONS, '--live', '--env', '--region']);
-const REPEATABLE = new Set(['--live', '--env']);
+const VALUE_OPTIONS = new Set([...PR_OPTIONS, '--live', '--env', '--region', '--vercel-project', '--vercel-team']);
+const REPEATABLE = new Set(['--live', '--env', '--vercel-project']);
 const FLAGS = new Set(['--json', '--no-hints', '--no-baseline', '--pr', '-h', '--help', '-v', '--version']);
-const ADAPTERS: LiveAdapterName[] = ['ssm'];
+const ADAPTERS: LiveAdapterName[] = ['ssm', 'vercel'];
 
 function parse(argv: string[]): Parsed | string {
   const out: Parsed = { flags: new Set(), values: new Map(), args: [] };
@@ -105,11 +109,12 @@ function v2Options(flags: Set<string>, values: Map<string, string[]>): V2 | stri
   const liveRaw = values.has('--live') ? list('--live') : null;
   if (liveRaw) {
     const bad = liveRaw.find((x) => !ADAPTERS.includes(x as LiveAdapterName));
-    if (bad !== undefined) return bad ? `unknown live adapter "${bad}" (use ssm)` : '--live needs ssm';
+    if (bad !== undefined) return bad ? `unknown live adapter "${bad}" (use ssm, vercel or ssm,vercel)` : '--live needs ssm, vercel or ssm,vercel';
     out.live = { adapters: [...new Set(liveRaw)] as LiveAdapterName[] };
   }
   const adapters = out.live?.adapters ?? [];
   for (const k of ['--env', '--region']) if (values.has(k) && !adapters.includes('ssm')) return `${k} only applies with --live ssm`;
+  for (const k of ['--vercel-project', '--vercel-team']) if (values.has(k) && !adapters.includes('vercel')) return `${k} only applies with --live vercel`;
   if (out.live) {
     if (values.has('--env')) {
       const envs = list('--env');
@@ -120,6 +125,20 @@ function v2Options(flags: Set<string>, values: Map<string, string[]>): V2 | stri
     if (region !== undefined) {
       if (!REGION_RE.test(region)) return `--region "${region}" is not an AWS region name (e.g. eu-west-1)`;
       out.live.region = region;
+    }
+    if (values.has('--vercel-project')) {
+      const projects: Record<string, string> = {};
+      for (const v of values.get('--vercel-project')!) {
+        const m = /^([^=\s]+)=([\w-]+)$/.exec(v);
+        if (!m) return `--vercel-project needs <service>=<projectId>, got "${v}"`;
+        projects[m[1]!] = m[2]!;
+      }
+      out.live.vercelProjects = projects;
+    }
+    const team = one('--vercel-team');
+    if (team !== undefined) {
+      if (!/^[\w-]+$/.test(team)) return '--vercel-team needs a team id, e.g. team_abc123';
+      out.live.vercelTeam = team;
     }
   }
   return out;

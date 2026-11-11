@@ -1,37 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { resolveRef } from '../src/live.js';
-import { main } from '../src/main.js';
 import { renderGithub, renderHuman, renderMarkdown, run } from '../src/index.js';
 import type { Net } from '../src/net.js';
-import type { Report } from '../src/types.js';
-import { fakeCloud, LEAK, type FakeCloud } from './fakecloud.js';
+import { AWS, cli, demoParams, fakeCloud, json, LEAK } from './fakecloud.js';
 import { find, fixture } from './helpers.js';
-
-export const AWS = { AWS_ACCESS_KEY_ID: 'AKIDEXAMPLE', AWS_SECRET_ACCESS_KEY: LEAK('aws-secret'), AWS_SESSION_TOKEN: LEAK('aws-session'), AWS_REGION: 'eu-west-1' };
-
-/** The CLI with an explicit environment and a fake network: nothing real is read or reached. */
-export async function cli(args: string[], opts: { env?: Record<string, string>; net?: Net } = {}) {
-  let out = '';
-  let err = '';
-  const code = await main(args, { stdout: (s) => void (out += s), stderr: (s) => void (err += s), env: opts.env ?? {}, cwd: process.cwd(), columns: 200, net: opts.net ?? fakeCloud() });
-  return { code, out, err };
-}
-
-export const json = (r: { out: string }) => JSON.parse(r.out) as Report;
-
-/** Every SSM reference in the live fixture exists, except orders' JWT_SECRET in dev. */
-export function demoParams(): FakeCloud['params'] {
-  const p: Record<string, string> = {
-    '/copilot/demo/prod/secrets/JWT_SECRET': LEAK('orders-jwt-prod'),
-    '/copilot/demo/dev/secrets/SIGNING_KEY': LEAK('signing-dev'),
-    '/demo/prod/SIGNING_KEY': LEAK('signing-prod'),
-    '/copilot/demo/dev/secrets/IDENTITY_JWT_SECRET': LEAK('identity-jwt-dev'),
-    '/copilot/demo/prod/secrets/IDENTITY_JWT_SECRET': LEAK('identity-jwt-prod'),
-    '/copilot/demo/dev/secrets/SESSION_SECRET': LEAK('session-dev'),
-    '/copilot/demo/prod/secrets/SESSION_SECRET': LEAK('session-prod'),
-  };
-  return { 'eu-west-1': p };
-}
 
 afterEach(() => {
   vi.unstubAllGlobals();

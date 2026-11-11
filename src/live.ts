@@ -1,17 +1,19 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { deployTargetsOf, type Analysis } from './analyze.js';
-import { readText } from './fsutil.js';
-import { Http, type HttpOptions, type Net } from './net.js';
+import { deployTargetsOf, requirementsOf, type Analysis } from './analyze.js';
+import { isFile, readJson, readText, rel } from './fsutil.js';
+import { Http, pool, type HttpOptions, type Net } from './net.js';
 import type { AwsCredentials } from './sigv4.js';
 import { REGION_RE, Ssm, type SsmFailure } from './ssm.js';
 import type { Finding, LiveAdapterName, LiveAdapterStatus, LiveCheck, LiveSummary, Service, Severity } from './types.js';
+import { Vercel, vercelProblem, type VercelVar } from './vercel.js';
 import { asMap, asString, parseYaml } from './yaml.js';
 
 /**
  * v2 live checks, opt-in per run. Read-only: SSM DescribeParameters (names
- * only) and, for --compare, GetParameters. Only names, existence and
- * verdicts leave this module; credentials, values and digests never do.
+ * only), Vercel's project env list (keys and targets, not decrypted) and, for
+ * --compare, SSM GetParameters and Vercel's single-variable GET. Only names,
+ * existence and verdicts leave this module; credentials, values and digests never do.
  */
 
 export interface LiveOptions {
@@ -21,6 +23,10 @@ export interface LiveOptions {
   envs?: string[];
   /** Overrides AWS_REGION / AWS_DEFAULT_REGION. */
   region?: string;
+  /** Overrides .vercel/project.json orgId and VERCEL_TEAM_ID. */
+  vercelTeam?: string;
+  /** Service name (or directory basename) -> Vercel project id, for services without .vercel/project.json. */
+  vercelProjects?: Record<string, string>;
   /** The process environment: the only place credentials are read from. */
   env: Record<string, string | undefined>;
   now?: () => Date;
@@ -174,6 +180,15 @@ export function awsCredentials(env: Record<string, string | undefined>): AwsCred
   return { accessKeyId, secretAccessKey, sessionToken: env['AWS_SESSION_TOKEN'] || undefined };
 }
 
+/** A service's linked Vercel project and its variables (no values). Held in memory only. */
+export interface VercelProject {
+  projectId: string;
+  teamId?: string;
+  /** Where the link came from: the service's .vercel/project.json, or --vercel-project. */
+  file: string;
+  vars: VercelVar[];
+}
+
 export interface LiveRun {
   a: Analysis;
   opts: LiveOptions;
@@ -181,6 +196,11 @@ export interface LiveRun {
   sink: FindingSink;
   checks: LiveCheck[];
   adapters: LiveAdapterStatus[];
+  /** SSM references that resolved, for --compare. */
+  ssmRefs: ParamRef[];
+  /** Vercel projects that were listed, for --compare. */
+  vercel: Map<Service, VercelProject>;
+  vercelClient?: Vercel;
 }
 
 async function runSsm(ctx: LiveRun): Promise<void> {
@@ -200,6 +220,7 @@ async function runSsm(ctx: LiveRun): Promise<void> {
     return;
   }
   const { refs, seenEnvs } = planSsm(a, region, opts.envs, sink, checks);
+  ctx.ssmRefs = refs;
   const unknownEnvs = (opts.envs ?? []).filter((e) => !seenEnvs.has(e));
   const ssm = new Ssm(ctx.http, creds, opts.now ?? (() => new Date()));
   const before = ctx.http.requests;
@@ -242,9 +263,133 @@ async function runSsm(ctx: LiveRun): Promise<void> {
   } else status.complete = true;
 }
 
+/** A service by exact name or unique directory basename, as same-as targets resolve. */
+function serviceNamed(a: Analysis, name: string): Service | undefined {
+  const exact = a.services.find((s) => s.name === name);
+  if (exact) return exact;
+  const base = a.services.filter((s) => path.basename(s.dir) === name);
+  return base.length === 1 ? base[0] : undefined;
+}
+
+/** The Vercel project a service deploys to, from --vercel-project or its .vercel/project.json. */
+function vercelLink(a: Analysis, svc: Service, opts: LiveOptions): { projectId: string; teamId?: string; file: string } | null {
+  const mapped = Object.entries(opts.vercelProjects ?? {}).find(([name]) => serviceNamed(a, name) === svc)?.[1];
+  const file = path.join(svc.dir, '.vercel', 'project.json');
+  const linked = readJson(file);
+  const orgId = typeof linked?.['orgId'] === 'string' && linked['orgId'].startsWith('team_') ? linked['orgId'] : undefined;
+  const teamId = opts.vercelTeam ?? orgId ?? (opts.env['VERCEL_TEAM_ID'] || undefined);
+  if (mapped) return { projectId: mapped, teamId, file: '--vercel-project' };
+  const projectId = linked?.['projectId'];
+  return typeof projectId === 'string' && projectId ? { projectId, teamId, file: rel(a.workspace, file) } : null;
+}
+
+const VERCEL_TARGETS = ['production', 'preview', 'development'] as const;
+
+async function runVercel(ctx: LiveRun): Promise<void> {
+  const { a, opts, sink, checks } = ctx;
+  const status: LiveAdapterStatus = { adapter: 'vercel', complete: false, requests: 0, checked: 0 };
+  ctx.adapters.push(status);
+  const token = opts.env['VERCEL_TOKEN'];
+  if (!token) {
+    status.problem = 'VERCEL_TOKEN is not set';
+    status.fix = 'export VERCEL_TOKEN with a token that can read the projects; wirelint reads it from the environment only';
+    return;
+  }
+  const unknown = Object.keys(opts.vercelProjects ?? {}).filter((name) => !serviceNamed(a, name));
+  if (unknown.length) {
+    status.problem = `--vercel-project names ${unknown.map((n) => `"${n}"`).join(', ')}, which ${unknown.length === 1 ? 'is not a discovered service' : 'are not discovered services'}`;
+    status.fix = `use one of: ${a.services.map((s) => s.name).join(', ')}`;
+    return;
+  }
+  const client = new Vercel(ctx.http, token);
+  ctx.vercelClient = client;
+  const before = ctx.http.requests;
+  const deployed = a.services.filter((svc) => vercelLink(a, svc, opts) || isFile(path.join(svc.dir, 'vercel.json')));
+  let failed: { problem: string; fix: string } | null = null;
+  let authFailed = false;
+
+  const listed = await pool(deployed, 4, async (svc) => {
+    const link = vercelLink(a, svc, opts);
+    if (!link) return { svc, link, vars: null };
+    return { svc, link, vars: authFailed ? null : await client.list(link.projectId, link.teamId) };
+  });
+  for (const { svc, link, vars } of listed) {
+    const svcRel = rel(a.workspace, svc.dir);
+    const reqs = requirementsOf(svc, { buildTime: true });
+    const label = (names: string[]) => names.join(' | ');
+    if (!link) {
+      for (const r of reqs) checks.push({ adapter: 'vercel', service: svc.name, variable: label(r.names), file: `${svcRel}/vercel.json`, env: 'production', status: 'not-checked', reason: 'no Vercel project is linked' });
+      sink.push(null, svc.name, {
+        check: 'live-not-checked',
+        severity: 'info',
+        variable: '(vercel project)',
+        file: `${svcRel}/vercel.json`,
+        problem: 'deployed on Vercel (vercel.json), but no Vercel project is linked, so its variables were not checked',
+        fix: `run "vercel link" in ${svcRel} to write .vercel/project.json, or pass --vercel-project ${svc.name}=<projectId>`,
+      });
+      continue;
+    }
+    if (!vars || !Array.isArray(vars)) {
+      if (vars && !failed) failed = vercelProblem(vars, `the project linked in ${link.file}`);
+      if (vars && vars.failure === 'auth') authFailed = true;
+      for (const r of reqs) checks.push({ adapter: 'vercel', service: svc.name, variable: label(r.names), file: link.file, env: 'production', status: 'not-checked', reason: 'the Vercel project could not be read' });
+      continue;
+    }
+    ctx.vercel.set(svc, { ...link, vars });
+    // vercel.json env and build.env are set for every target.
+    const fromFile = new Set([
+      ...svc.targets.filter((t) => t.kind === 'vercel').flatMap((t) => t.envs.flatMap((e) => [...e.vars.keys()])),
+      ...svc.build.filter((b) => b.kind === 'vercel').flatMap((b) => [...b.names]),
+    ]);
+    const setFor = (name: string, target: string) => fromFile.has(name) || vars.some((v) => v.key === name && !v.branchOnly && v.targets.includes(target));
+    for (const r of reqs) {
+      const missing: string[] = [];
+      for (const target of VERCEL_TARGETS) {
+        const present = r.names.some((n) => setFor(n, target));
+        status.checked++;
+        checks.push({ adapter: 'vercel', service: svc.name, variable: label(r.names), file: link.file, env: target, status: present ? 'present' : 'missing' });
+        if (!present) missing.push(target);
+      }
+      if (missing.length === 0) continue;
+      const read = r.names.length > 1 ? `fallback chain ${r.names.join(' -> ')} read in ${r.file}:${r.line}` : `read in ${r.file}:${r.line}`;
+      const chain = r.names.length > 1 ? `; any one of ${r.names.join(', ')} satisfies the chain` : '';
+      const add = (targets: string[]) => targets.map((t) => `vercel env add ${r.names[0]} ${t}`).join(', then ');
+      const kind = r.kind === 'required' ? 'required' : r.kind === 'localdefault' ? 'falls back to a localhost default' : 'no default';
+      if (missing.includes('production')) {
+        sink.push(svc, svc.name, {
+          check: 'live-missing',
+          severity: r.hard ? 'error' : 'hint',
+          variable: label(r.names),
+          file: link.file,
+          env: 'production',
+          problem: `${read} (${kind}) but the Vercel project does not set ${r.names.length > 1 ? 'any of them' : 'it'} for production` +
+            (r.kind === 'localdefault' ? '; once deployed it silently points at localhost' : ''),
+          fix: `in ${svcRel}, run "${add(['production'])}" (or add it under Settings > Environment Variables)${chain}`,
+        });
+      }
+      const other = missing.filter((t) => t !== 'production');
+      if (other.length) {
+        sink.push(svc, svc.name, {
+          check: 'live-missing',
+          severity: 'hint',
+          variable: label(r.names),
+          file: link.file,
+          env: other.join(','),
+          problem: `${read} (${kind}) but the Vercel project does not set ${r.names.length > 1 ? 'any of them' : 'it'} for ${other.join(' or ')}`,
+          fix: `in ${svcRel}, run "${add(other)}" if ${other.length > 1 ? 'those deployments need' : 'that deployment needs'} it${chain}`,
+        });
+      }
+    }
+  }
+  status.requests = ctx.http.requests - before;
+  if (failed) Object.assign(status, failed);
+  else status.complete = true;
+}
+
 export async function runLive(a: Analysis, opts: LiveOptions, net: Net): Promise<LiveResult> {
-  const ctx: LiveRun = { a, opts, http: new Http(net, { ...HTTP_DEFAULTS, ...opts.http }), sink: new FindingSink(), checks: [], adapters: [] };
+  const ctx: LiveRun = { a, opts, http: new Http(net, { ...HTTP_DEFAULTS, ...opts.http }), sink: new FindingSink(), checks: [], adapters: [], ssmRefs: [], vercel: new Map() };
   if (opts.adapters.includes('ssm')) await runSsm(ctx);
+  if (opts.adapters.includes('vercel')) await runVercel(ctx);
   const live: LiveSummary = {
     adapters: ctx.adapters,
     compare: !!opts.compare,
