@@ -112,8 +112,66 @@ export interface ScanResult {
   ports: number[];
 }
 
-/** Only an operator (and parentheses or `this.`) between two reads makes them one chain. */
+/** Only a fallback operator (and grouping parentheses) between two reads makes them one chain. */
 const CHAIN_GAP = /^[\s()]*(\|\||\?\?)[\s(]*$/;
+
+/**
+ * Whether the read starting at `start` stands as a bare operand: not negated,
+ * compared, or the left side of a tighter operator. Returns how many grouping
+ * parentheses open right before it, or null when it is not bare. A call's own
+ * parenthesis (`f(process.env.A ...`) is a boundary, not a group.
+ */
+function bareBefore(text: string, start: number): { opens: number } | null {
+  let i = start - 1;
+  let opens = 0;
+  for (;;) {
+    while (i >= 0 && /\s/.test(text[i]!)) i--;
+    if (text[i] !== '(') break;
+    let k = i - 1;
+    while (k >= 0 && /\s/.test(text[k]!)) k--;
+    if (k >= 0 && /[\w$)\].]/.test(text[k]!)) return { opens }; // call argument
+    opens++;
+    i = k;
+  }
+  if (i < 0) return { opens };
+  const c = text[i]!;
+  if (',:[{;?|'.includes(c)) return { opens };
+  if (c === '=' && !'=!<>'.includes(text[i - 1] ?? '')) return { opens };
+  if (c === '>' && text[i - 1] === '=') return { opens };
+  if (/\breturn$/.test(text.slice(Math.max(0, i - 6), i + 1))) return { opens };
+  return null;
+}
+
+/** Track grouping depth across a gap; null when it closes a parenthesis the chain did not open. */
+function parenDepth(gap: string, depth: number): number | null {
+  for (const ch of gap) {
+    if (ch === '(') depth++;
+    else if (ch === ')' && --depth < 0) return null;
+  }
+  return depth;
+}
+
+/**
+ * Whether the read ending at `end` is a bare operand (not followed by a member
+ * access, call, comparison or tighter operator). Closes up to `depth` groups.
+ * Returns the offset just after the chain, or null.
+ */
+function bareAfter(text: string, end: number, depth: number): number | null {
+  let i = end;
+  for (;;) {
+    while (i < text.length && /\s/.test(text[i]!)) i++;
+    if (text[i] === ')' && depth > 0) {
+      depth--;
+      i++;
+      continue;
+    }
+    break;
+  }
+  const c = text[i];
+  if (c === undefined || ';,)]}:?|'.includes(c)) return i;
+  if (c === '!' && text[i + 1] !== '=') return i;
+  return null;
+}
 
 export function scanSource(source: string): ScanResult {
   const text = stripComments(source);
@@ -205,17 +263,26 @@ export function scanSource(source: string): ScanResult {
   const chains: ScanResult['chains'] = [];
   spans.sort((a, b) => a.start - b.start);
   for (let i = 0; i < spans.length; ) {
+    const before = bareBefore(text, spans[i]!.start);
+    if (!before) {
+      i++;
+      continue;
+    }
+    let depth = before.opens;
     let j = i;
-    while (j + 1 < spans.length && CHAIN_GAP.test(text.slice(spans[j]!.end, spans[j + 1]!.start).replace(/\bthis\s*\.\s*/g, ''))) j++;
-    if (j > i) {
+    while (j + 1 < spans.length) {
+      const gap = text.slice(spans[j]!.end, spans[j + 1]!.start);
+      if (!CHAIN_GAP.test(gap)) break;
+      const d = parenDepth(gap, depth);
+      if (d === null) break;
+      depth = d;
+      j++;
+    }
+    const after = j > i ? bareAfter(text, spans[j]!.end, depth) : null;
+    if (after !== null) {
       const members = spans.slice(i, j + 1);
       const names = [...new Set(members.map((x) => x.name))];
-      if (names.length > 1) {
-        const last = members[members.length - 1]!;
-        // A closing parenthesis right after the chain belongs to it: `(A ?? B) ?? 'x'`.
-        const close = /^\s*\)*/.exec(text.slice(last.end))![0].length;
-        chains.push({ names, line: lineOf(members[0]!.start), kind: kindFromContext(text, members[0]!.start, last.end + close) });
-      }
+      if (names.length > 1) chains.push({ names, line: lineOf(members[0]!.start), kind: kindFromContext(text, members[0]!.start, after) });
     }
     i = j + 1;
   }

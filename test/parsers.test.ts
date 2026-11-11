@@ -263,6 +263,30 @@ describe('fallback chains', () => {
       { names: ['C_ONE', 'C_TWO'], line: 4, kind: 'default' },
     ]);
     // Each member keeps the kind v0 gave it.
+    expect(scan.reads.length).toBe(10);
     expect(Object.fromEntries(scan.reads.map((r) => [r.name, r.kind]))).toMatchObject({ A_ONE: 'default', A_TWO: 'default', B_ONE: 'default', B_TWO: 'default' });
+  });
+});
+
+describe('fallback chain members must be bare reads', () => {
+  it.each([
+    ['isSet(process.env.A_ONE) || process.env.A_TWO'],
+    ['const x = !process.env.A_ONE || process.env.A_TWO;'],
+    ['const x = flag === process.env.A_ONE || process.env.A_TWO;'],
+    ['const x = process.env.A_ONE || process.env.A_TWO.trim();'],
+    ['const x = process.env.A_ONE || process.env.A_TWO === "1";'],
+    ['const x = ok && process.env.A_ONE || process.env.A_TWO;'],
+    ['const x = f(process.env.A_ONE) ?? process.env.A_TWO;'],
+  ])('no chain in %s', (src) => {
+    expect(scanSource(src).chains).toEqual([]);
+  });
+
+  it.each([
+    ['isSet(process.env.A_ONE ?? process.env.A_TWO)', 'plain'],
+    ['return process.env.A_ONE || process.env.A_TWO;', 'plain'],
+    ['const x = ((process.env.A_ONE) ?? process.env.A_TWO) ?? "http://localhost:1";', 'localdefault'],
+    ['const f = () => process.env.A_ONE ?? process.env.A_TWO;', 'plain'],
+  ])('a chain in %s', (src, kind) => {
+    expect(scanSource(src).chains).toEqual([{ names: ['A_ONE', 'A_TWO'], line: 1, kind }]);
   });
 });
