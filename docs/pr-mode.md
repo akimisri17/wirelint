@@ -50,7 +50,7 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
-      - run: npx wirelint --pr --comment-file wirelint-comment.md .
+      - run: npx @akhil-misri/wirelint --pr --comment-file wirelint-comment.md .
       - if: always()
         run: gh pr comment ${{ github.event.pull_request.number }} --body-file wirelint-comment.md --edit-last || gh pr comment ${{ github.event.pull_request.number }} --body-file wirelint-comment.md
         env: { GH_TOKEN: "${{ github.token }}" }

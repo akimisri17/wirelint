@@ -3,7 +3,7 @@
 Catch cross-service environment-variable mistakes before they deploy.
 
 ```bash
-npx wirelint .
+npx @akhil-misri/wirelint .
 ```
 
 One command, no config file, no cloud credentials, no network. wirelint reads
@@ -62,9 +62,19 @@ exact fix.
 Requires Node 22 or newer.
 
 ```bash
-npx wirelint .                 # a monorepo
-npx wirelint ../my-workspace   # a folder of sibling repos
+npx @akhil-misri/wirelint .                 # a monorepo
+npx @akhil-misri/wirelint ../my-workspace   # a folder of sibling repos
 ```
+
+The package is `@akhil-misri/wirelint`; the command it installs is `wirelint`.
+To use the short name, add it to your project:
+
+```bash
+npm install --save-dev @akhil-misri/wirelint
+npx wirelint .
+```
+
+The rest of this README writes `wirelint` for short.
 
 In CI, findings land on the right line of the pull request:
 
@@ -72,7 +82,7 @@ In CI, findings land on the right line of the pull request:
 - uses: actions/checkout@v4
 - uses: actions/setup-node@v4
   with: { node-version: 22 }
-- run: npx wirelint .
+- run: npx @akhil-misri/wirelint .
 ```
 
 Too many findings on day one? See
