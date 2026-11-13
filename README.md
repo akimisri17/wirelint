@@ -1,10 +1,18 @@
 # wirelint
 
+[![npm version](https://img.shields.io/npm/v/%40akhil-misri%2Fwirelint)](https://www.npmjs.com/package/@akhil-misri/wirelint)
+[![CI](https://github.com/akimisri17/wirelint/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/akimisri17/wirelint/actions/workflows/ci.yml)
+[![Node](https://img.shields.io/node/v/%40akhil-misri%2Fwirelint)](package.json)
+[![runtime dependencies: 0](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)](package.json)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 Catch cross-service environment-variable mistakes before they deploy.
 
 ```bash
 npx @akhil-misri/wirelint .
 ```
+
+![wirelint reporting three environment-variable mistakes in a two-service workspace, each with the file and the exact fix](https://raw.githubusercontent.com/akimisri17/wirelint/main/assets/demo.svg)
 
 One command, no config file, no cloud credentials, no network. wirelint reads
 the code and config files already in your repos, works out which variables
