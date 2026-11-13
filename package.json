@@ -1,6 +1,6 @@
 {
-  "name": "wirelint",
-  "version": "0.3.0",
+  "name": "@akhil-misri/wirelint",
+  "version": "0.3.1",
   "description": "Zero-config CLI that catches cross-service environment-variable mistakes before deploy.",
   "keywords": [
     "env",
@@ -34,6 +34,9 @@
     "ROADMAP.md",
     "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=22"
   },
